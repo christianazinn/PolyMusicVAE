@@ -502,7 +502,7 @@ if __name__ == "__main__":
         "latent_dim": 512,
         "learning_rate": 1e-4,
         "beta_warmup_steps": 10000,
-        "lr_schedule": "warmup_cosine",
+        "lr_schedule": "cosine",
         **config_data,
     }
 
