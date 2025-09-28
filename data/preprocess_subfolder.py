@@ -36,19 +36,24 @@ def preprocess_file(midi_file: str | Path, tokenizer: REMI, config: PreprocessCo
             start = bar_breaks[i] + 1  # do not include the opening bar token
             end = bar_breaks[i + config.num_bars]
             tolist = ids[start:end].tolist() + [config.eos_id]
-            if len(tolist) > config.num_bars + 1 and len(tolist) <= config.max_seq_len - 1:  # room for BOS
+            if (
+                len(tolist) > config.num_bars + 1
+                and len(tolist) <= config.max_seq_len - 1
+            ):  # room for BOS
                 yield tolist
 
 
-def process(file_paths, output_path: str | Path, tokenizer: REMI, config: PreprocessConfig):
+def process(
+    file_paths, output_path: str | Path, tokenizer: REMI, config: PreprocessConfig
+):
     def chunk_generator_with_stats():
-        for file_path in tqdm(file_paths, desc="Processing files", unit="file"):
+        for file_path in tqdm(file_paths, desc="Processing files", unit=" files"):
             try:
                 for sample in preprocess_file(file_path, tokenizer, config):
                     yield {"s": sample}
             except Exception:
                 continue
-    
+
     dataset = Dataset.from_generator(chunk_generator_with_stats)
     dataset.info.description = json.dumps(config.__dict__)
     dataset.save_to_disk(output_path)  # type: ignore
@@ -59,7 +64,7 @@ def process(file_paths, output_path: str | Path, tokenizer: REMI, config: Prepro
 def sanitize(file_paths: list[Path]):
     for i, path in enumerate(file_paths):
         if "e59b70ca47d81f8f3507d9c421eabeb2" in str(path):
-            return file_paths[:i] + file_paths[i+1:]
+            return file_paths[:i] + file_paths[i + 1 :]
     return file_paths
 
 
@@ -84,7 +89,7 @@ def main():
     config = PreprocessConfig(
         num_bars=num_bars,
         vocab_size=len(tokenizer.vocab),
-        bar_id=tokenizer.vocab["Bar_None"], 
+        bar_id=tokenizer.vocab["Bar_None"],
         bos_id=tokenizer.vocab["BOS_None"],
         eos_id=tokenizer.vocab["EOS_None"],
         pad_id=tokenizer.vocab["PAD_None"],
@@ -95,7 +100,7 @@ def main():
     # b/c of how it's launched, safer to abspath
     out_path = Path(f"/home/christian/vae/data_nb_{num_bars}/{split}")
     out_path.mkdir(exist_ok=True, parents=True)
-    
+
     print("Globbing...")
     file_paths = list(data_path.rglob("*.mid"))
     print(f"Globbed {len(file_paths)} files. Processing...")
