@@ -288,7 +288,7 @@ class MusicVAE(L.LightningModule):
 
             for alpha in alphas:
                 z_interp = (1 - alpha) * z1 + alpha * z2
-                generated = self.decode_autoregressive(z_interp.unsqueeze(0))
+                generated = self.decode_autoregressive(z_interp) # .unsqueeze(0))
                 interpolated.append(generated)
 
         return interpolated
@@ -419,6 +419,7 @@ class MusicVAE(L.LightningModule):
 
         return total_loss
 
+    # TODO: this is ENTIRELY fucked
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
         optimizer = torch.optim.AdamW(
@@ -466,19 +467,19 @@ class MusicVAE(L.LightningModule):
         else:
             return optimizer
 
-    def on_train_epoch_end(self):
-        # Log some generated samples periodically
-        if self.current_epoch % 10 == 0:
-            with torch.no_grad():
-                generated = self.generate(batch_size=4, temperature=0.8)
-                self.logger.log_table(
-                    key="generated_samples",
-                    columns=["epoch", "sample_id", "sequence"],
-                    data=[
-                        [self.current_epoch, i, seq.cpu().tolist()]
-                        for i, seq in enumerate(generated)
-                    ],
-                )
+    # def on_train_epoch_end(self):
+    #     # Log some generated samples periodically
+    #     if self.current_epoch % 10 == 0:
+    #         with torch.no_grad():
+    #             generated = self.generate(batch_size=4, temperature=0.8)
+    #             self.logger.log_table(
+    #                 key="generated_samples",
+    #                 columns=["epoch", "sample_id", "sequence"],
+    #                 data=[
+    #                     [self.current_epoch, i, seq.cpu().tolist()]
+    #                     for i, seq in enumerate(generated)
+    #                 ],
+    #             )
 
 
 def get_callbacks():
@@ -524,6 +525,7 @@ if __name__ == "__main__":
         "gradient_clip_val": 1.0,
     }
 
+    # tune hyperparams, move somewhere else (.yaml?)
     config = {
         "d_model": 512,
         "n_heads": 8,
@@ -539,3 +541,4 @@ if __name__ == "__main__":
     model = MusicVAE(**config)
     trainer = L.Trainer(**trainer_config)
     trainer.fit(model, train_loader, val_loader)
+ 

@@ -76,8 +76,8 @@ def create_splits(
 def create_dataloaders(
     ds_path: PathLike,
     batch_size: int = 32,
-    val_split: float = 0.1,
-    test_split: float = 0.1,
+    val_split: float = 0.0,
+    test_split: float = 0.0,
     num_workers: int = 4,
     seed: int = 42,
     pin_memory: bool = True,
