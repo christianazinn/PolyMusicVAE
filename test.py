@@ -53,7 +53,6 @@ def test_random_noise(model: MusicVAE, tokenizer: REMI, num_samples: int = 5):
     plt.savefig('test/random_samples.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-# TODO: move this to the validation loop! also add active dimension counting with KL > threshold
 # are dataset latents close to each other? posterior collapse
 def test_latents(model: MusicVAE, num_samples: int = 20):
     loader, _, _, _ = create_dataloaders(ds_path="/home/christian/vae/data_nb_1/a")

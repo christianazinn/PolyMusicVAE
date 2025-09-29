@@ -82,6 +82,10 @@ class MusicVAE(L.LightningModule):
         self.lr_schedule = lr_schedule
         self.warmup_steps = warmup_steps
 
+        # tracking
+        self._val_latent_means = []
+        self._val_latent_vars = []
+
         # Embedding layers
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
@@ -367,8 +371,7 @@ class MusicVAE(L.LightningModule):
         self.log("train/total_loss", total_loss, on_step=True, on_epoch=True)
         self.log("train/reconstruction_loss", recon_loss, on_step=True, on_epoch=True)
         self.log("train/kl_loss", kl_loss, on_step=True, on_epoch=True)
-        self.log("train/beta", beta, on_step=True)
-        self.log("train/perplexity", torch.exp(recon_loss), on_step=True, on_epoch=True)
+        self.log("trainer/beta", beta, on_step=True)
 
         # Update training step counter
         self.training_step_count += 1
@@ -393,7 +396,11 @@ class MusicVAE(L.LightningModule):
         self.log("val/total_loss", total_loss, on_epoch=True)
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
         self.log("val/kl_loss", kl_loss, on_epoch=True)
-        self.log("val/perplexity", torch.exp(recon_loss), on_epoch=True)
+
+        # Store latent means for similarity analysis
+        if len(self._val_latent_means) < 1000:
+            self._val_latent_means.append(outputs["latent_dist"].mean.detach())
+            self._val_latent_vars.append(outputs["latent_dist"].variance.detach())
 
         return total_loss
 
@@ -415,11 +422,9 @@ class MusicVAE(L.LightningModule):
         self.log("test/total_loss", total_loss)
         self.log("test/reconstruction_loss", recon_loss)
         self.log("test/kl_loss", kl_loss)
-        self.log("test/perplexity", torch.exp(recon_loss))
 
         return total_loss
 
-    # TODO: this is ENTIRELY fucked
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
         optimizer = torch.optim.AdamW(
@@ -467,19 +472,43 @@ class MusicVAE(L.LightningModule):
         else:
             return optimizer
 
-    # def on_train_epoch_end(self):
-    #     # Log some generated samples periodically
-    #     if self.current_epoch % 10 == 0:
-    #         with torch.no_grad():
-    #             generated = self.generate(batch_size=4, temperature=0.8)
-    #             self.logger.log_table(
-    #                 key="generated_samples",
-    #                 columns=["epoch", "sample_id", "sequence"],
-    #                 data=[
-    #                     [self.current_epoch, i, seq.cpu().tolist()]
-    #                     for i, seq in enumerate(generated)
-    #                 ],
-    #             )
+    def on_validation_epoch_end(self):
+        """Compute and log latent similarity metrics at the end of validation."""
+        if not hasattr(self, '_val_latent_means') or len(self._val_latent_means) == 0:
+            return
+        
+        # Concatenate all latent means from validation batches
+        all_means = torch.cat(self._val_latent_means, dim=0)
+        
+        # Compute pairwise cosine similarities
+        normalized = F.normalize(all_means, dim=1)
+        similarity_matrix = torch.mm(normalized, normalized.t())
+        
+        # Extract upper triangular (excluding diagonal)
+        mask = torch.triu(torch.ones_like(similarity_matrix), diagonal=1).bool()
+        similarities = similarity_matrix[mask]
+        
+        # Compute statistics
+        self.log("val_sim/mean", similarities.mean())
+        self.log("val_sim/std", similarities.std())
+        self.log("val_sim/min", similarities.min())
+        self.log("val_sim/max", similarities.max())
+        
+        # Compute threshold percentages
+        total_pairs = len(similarities)
+        pct_above_90 = ((similarities > 0.9).sum().float() / total_pairs * 100)
+        pct_above_75 = ((similarities > 0.75).sum().float() / total_pairs * 100)
+        
+        self.log("val_sim/above_0.9", pct_above_90)
+        self.log("val_sim/above_0.75", pct_above_75)
+
+        vars = torch.cat(self._val_latent_vars, dim=0)
+        self.log("val_latent/active_units_0.1", (vars.mean(0) > 0.1).sum())
+        self.log("val_latent/active_units_0.01", (vars.mean(0) > 0.01).sum())
+
+        # Clear stored latent means for next epoch
+        self._val_latent_means = []
+        self._val_latent_vars = []
 
 
 def get_callbacks():
@@ -489,7 +518,7 @@ def get_callbacks():
             monitor="val/total_loss",
             dirpath="checkpoints/",
             filename="music-vae-{epoch:02d}-{val/total_loss:.2f}",
-            save_top_k=3,
+            save_top_k=10,
             mode="min",
             save_last=True,
         ),
@@ -514,7 +543,7 @@ if __name__ == "__main__":
     train_loader, val_loader, _, config_data = create_dataloaders(**data_config)
 
     trainer_config = {
-        "max_epochs": 5,
+        "max_epochs": 10,
         "devices": 1,
         "accelerator": "gpu" if torch.cuda.is_available() else "cpu",
         "log_every_n_steps": 50,
