@@ -1,12 +1,13 @@
 import numpy as np
 import sys
+import os
+import json
 from dataclasses import dataclass
 from datasets import Dataset
 from miditok import REMI, TokSequence
 from pathlib import Path
 from symusic import Score
 from tqdm import tqdm
-import json
 
 
 @dataclass
@@ -103,7 +104,11 @@ def main():
 
     print("Globbing...")
     file_paths = list(data_path.rglob("*.mid"))
-    print(f"Globbed {len(file_paths)} files. Processing...")
+    before_len = len(file_paths)
+    with open(os.path.dirname(__file__) + "/lakh_good_martin.json", "r") as f:
+        good_files = set(json.load(f))
+    file_paths = [fp for fp in file_paths if fp.name.strip(".mid") in good_files]
+    print(f"Globbed {len(file_paths)} files (originally {before_len}). Processing...")
 
     if split in ["e", ""]:
         print("Bad file in list, removing...")

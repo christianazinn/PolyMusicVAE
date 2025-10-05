@@ -398,7 +398,7 @@ class MusicVAE(L.LightningModule):
         self.log("val/kl_loss", kl_loss, on_epoch=True)
 
         # Store latent means for similarity analysis
-        if len(self._val_latent_means) < 1000:
+        if len(self._val_latent_means) < 100:
             self._val_latent_means.append(outputs["latent_dist"].mean.detach())
             self._val_latent_vars.append(outputs["latent_dist"].variance.detach())
 
@@ -531,7 +531,7 @@ def get_callbacks():
 if __name__ == "__main__":
 
     data_config = {
-        "ds_path": "/home/christian/vae/data_nb_1/a",
+        "ds_path": "/home/christian/vae/data_nb_1/b",
         "batch_size": 64,
         "val_split": 0.1,
         "test_split": 0.0,  # no test for now
@@ -543,7 +543,7 @@ if __name__ == "__main__":
     train_loader, val_loader, _, config_data = create_dataloaders(**data_config)
 
     trainer_config = {
-        "max_epochs": 10,
+        "max_epochs": 5,
         "devices": 1,
         "accelerator": "gpu" if torch.cuda.is_available() else "cpu",
         "log_every_n_steps": 50,

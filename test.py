@@ -97,13 +97,47 @@ def test_latents(model: MusicVAE, num_samples: int = 20):
     print(f"Std:  {similarities.std():.4f}")
     print(f"Min:  {similarities.min():.4f}")
     print(f"Max:  {similarities.max():.4f}")
+
+def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
+    score = Score.from_file(path)
+    tokenized = tokenizer.encode(score)[0].ids[1:]  # remove BOS
+    tensor = torch.tensor(tokenized, dtype=torch.int32).unsqueeze(0).cuda()
+    with torch.no_grad():
+        latent_dist, _ = model.encode(tensor)
+        reconstructed_ids = model.decode_autoregressive(latent_dist.mean)
+    reconstructed_score = tokenizer.decode(reconstructed_ids.cpu().numpy()).resample(tpq=4, min_dur=1)
+    
+    original_pianoroll = score.pianoroll(
+        modes=["frame", "onset"],
+        pitch_range=[0, 128],
+        encode_velocity=False
+    )
+    reconstructed_pianoroll = reconstructed_score.pianoroll(
+        modes=["frame", "onset"],
+        pitch_range=[0, 128],
+        encode_velocity=False
+    )
+    
+    _, axes = plt.subplots(2, 1, figsize=(6, 6))
+    axes[0].imshow(original_pianoroll[0, 0] + original_pianoroll[1, 0], 
+                        origin='lower', aspect='auto',
+                        extent=[0, original_pianoroll.shape[3], 0, 128])
+    axes[0].set_title('Original')
+    axes[1].imshow(reconstructed_pianoroll[0, 0] + reconstructed_pianoroll[1, 0], 
+                        origin='lower', aspect='auto',
+                        extent=[0, reconstructed_pianoroll.shape[3], 0, 128])
+    axes[1].set_title('Reconstructed')
+    plt.tight_layout()
+    plt.savefig('test/reconstruction.png', dpi=300, bbox_inches='tight')
+    plt.close()
     
 def main():
     tokenizer = REMI()
     model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
     # test_interpolate(model, tokenizer, "test/bar_9.mid", "test/bar_17.mid")
     # test_random_noise(model, tokenizer, num_samples=5)
-    test_latents(model, num_samples=1000)
+    # test_latents(model, num_samples=1000)
+    test_reconstruction(model, tokenizer, "test/bar_9.mid")
 
 if __name__ == "__main__":
     main()
