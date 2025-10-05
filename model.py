@@ -499,8 +499,8 @@ class MusicVAE(L.LightningModule):
         pct_above_90 = ((similarities > 0.9).sum().float() / total_pairs * 100)
         pct_above_75 = ((similarities > 0.75).sum().float() / total_pairs * 100)
         
-        self.log("val_sim/above_0.9", pct_above_90)
-        self.log("val_sim/above_0.75", pct_above_75)
+        self.log("val_sim/above_0.9_pct", pct_above_90)
+        self.log("val_sim/above_0.75_pct", pct_above_75)
 
         vars = torch.cat(self._val_latent_vars, dim=0)
         self.log("val_latent/active_units_0.1", (vars.mean(0) > 0.1).sum())
