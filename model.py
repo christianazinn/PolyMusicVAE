@@ -12,7 +12,8 @@ from lightning.pytorch.callbacks import (
 import math
 from dataset import create_dataloaders
 
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision("medium")
+
 
 class PositionalEncoding(nn.Module):
     """Positional encoding for transformer sequences."""
@@ -57,9 +58,10 @@ class MusicVAE(L.LightningModule):
         beta_start: float = 0.0,
         beta_end: float = 1.0,
         beta_warmup_steps: int = 10000,
+        free_bits: int | None = None,
         lr_schedule: str = "cosine",
         warmup_steps: int = 4000,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -79,6 +81,7 @@ class MusicVAE(L.LightningModule):
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.beta_warmup_steps = beta_warmup_steps
+        self.free_bits = free_bits
         self.lr_schedule = lr_schedule
         self.warmup_steps = warmup_steps
 
@@ -292,7 +295,7 @@ class MusicVAE(L.LightningModule):
 
             for alpha in alphas:
                 z_interp = (1 - alpha) * z1 + alpha * z2
-                generated = self.decode_autoregressive(z_interp) # .unsqueeze(0))
+                generated = self.decode_autoregressive(z_interp)  # .unsqueeze(0))
                 interpolated.append(generated)
 
         return interpolated
@@ -345,7 +348,14 @@ class MusicVAE(L.LightningModule):
         prior = Normal(
             torch.zeros_like(latent_dist.mean), torch.ones_like(latent_dist.stddev)
         )
-        kl_loss = torch.distributions.kl_divergence(latent_dist, prior).mean()
+        kl_per_dim = torch.distributions.kl_divergence(latent_dist, prior).mean()
+        if self.free_bits is not None:
+            free_bits = self.free_bits / self.latent_dim
+            kl_loss = torch.max(
+                kl_per_dim - free_bits, torch.zeros_like(kl_per_dim)
+            ).mean()
+        else:
+            kl_loss = kl_per_dim
 
         # Total loss
         total_loss = reconstruction_loss + beta * kl_loss
@@ -474,31 +484,31 @@ class MusicVAE(L.LightningModule):
 
     def on_validation_epoch_end(self):
         """Compute and log latent similarity metrics at the end of validation."""
-        if not hasattr(self, '_val_latent_means') or len(self._val_latent_means) == 0:
+        if not hasattr(self, "_val_latent_means") or len(self._val_latent_means) == 0:
             return
-        
+
         # Concatenate all latent means from validation batches
         all_means = torch.cat(self._val_latent_means, dim=0)
-        
+
         # Compute pairwise cosine similarities
         normalized = F.normalize(all_means, dim=1)
         similarity_matrix = torch.mm(normalized, normalized.t())
-        
+
         # Extract upper triangular (excluding diagonal)
         mask = torch.triu(torch.ones_like(similarity_matrix), diagonal=1).bool()
         similarities = similarity_matrix[mask]
-        
+
         # Compute statistics
         self.log("val_sim/mean", similarities.mean())
         self.log("val_sim/std", similarities.std())
         self.log("val_sim/min", similarities.min())
         self.log("val_sim/max", similarities.max())
-        
+
         # Compute threshold percentages
         total_pairs = len(similarities)
-        pct_above_90 = ((similarities > 0.9).sum().float() / total_pairs * 100)
-        pct_above_75 = ((similarities > 0.75).sum().float() / total_pairs * 100)
-        
+        pct_above_90 = (similarities > 0.9).sum().float() / total_pairs * 100
+        pct_above_75 = (similarities > 0.75).sum().float() / total_pairs * 100
+
         self.log("val_sim/above_0.9_pct", pct_above_90)
         self.log("val_sim/above_0.75_pct", pct_above_75)
 
@@ -526,48 +536,3 @@ def get_callbacks():
         LearningRateMonitor(logging_interval="step"),
     ]
     return callbacks
-
-
-if __name__ == "__main__":
-
-    data_config = {
-        "ds_path": "/home/christian/vae/data_nb_1/b",
-        "batch_size": 64,
-        "val_split": 0.1,
-        "test_split": 0.0,  # no test for now
-        "num_workers": 4,
-        "seed": 42,
-        "pin_memory": True,
-    }
-
-    train_loader, val_loader, _, config_data = create_dataloaders(**data_config)
-
-    trainer_config = {
-        "max_epochs": 5,
-        "devices": 1,
-        "accelerator": "gpu" if torch.cuda.is_available() else "cpu",
-        "log_every_n_steps": 50,
-        "deterministic": False,
-        "precision": "bf16-mixed" if torch.cuda.is_available() else 32,
-        "logger": WandbLogger(project="music-vae", log_model=True),
-        "callbacks": get_callbacks(),
-        "gradient_clip_val": 1.0,
-    }
-
-    # tune hyperparams, move somewhere else (.yaml?)
-    config = {
-        "d_model": 512,
-        "n_heads": 8,
-        "n_encoder_layers": 6,
-        "n_decoder_layers": 6,
-        "latent_dim": 512,
-        "learning_rate": 1e-4,
-        "beta_warmup_steps": 10000,
-        "lr_schedule": "cosine",
-        **config_data,
-    }
-
-    model = MusicVAE(**config)
-    trainer = L.Trainer(**trainer_config)
-    trainer.fit(model, train_loader, val_loader)
- 

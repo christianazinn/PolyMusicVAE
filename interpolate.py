@@ -33,7 +33,7 @@ def test_interpolate_for(model: MusicVAE, tokenizer: REMI, ds, num_steps: int = 
         cumulative_widths = np.cumsum([0] + widths)
         
         cmap = plt.cm.gnuplot
-        adj = 30
+        adj = 100
         
         background = np.zeros((h, w, 3))
         for i in range(n_rolls):
@@ -59,8 +59,8 @@ def test_interpolate_for(model: MusicVAE, tokenizer: REMI, ds, num_steps: int = 
 
 
 if __name__ == "__main__":
-    ds, _, _, _ = create_splits(ds_path="/home/christian/vae/data_nb_1/a", val_split=0.0, test_split=0.0)
+    ds, _, _, _ = create_splits(ds_path="/home/christian/vae/data_nb_1/b", val_split=0.0, test_split=0.0)
     tokenizer = REMI()
-    model = MusicVAE.load_from_checkpoint("checkpoints/eager-music-6/music-vae-epoch=02-val/total_loss=0.29.ckpt")
+    model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
     # model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
     test_interpolate_for(model, tokenizer, ds, iiter=10)

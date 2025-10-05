@@ -1,0 +1,6 @@
+inherit: default_1024
+name: "19_beta_0.2_1024d_free_bits_24"
+
+model:
+  beta_end: 0.2
+  free_bits: 24
