@@ -513,8 +513,13 @@ class MusicVAE(L.LightningModule):
         self.log("val_sim/above_0.75_pct", pct_above_75)
 
         vars = torch.cat(self._val_latent_vars, dim=0)
-        self.log("val_latent/active_units_0.1", (vars.mean(0) > 0.1).sum())
-        self.log("val_latent/active_units_0.01", (vars.mean(0) > 0.01).sum())
+        self.log(
+            "val_latent/active_units_0.1", (vars.mean(0) > 0.1).sum().to(torch.float32)
+        )
+        self.log(
+            "val_latent/active_units_0.01",
+            (vars.mean(0) > 0.01).sum().to(torch.float32),
+        )
 
         # Clear stored latent means for next epoch
         self._val_latent_means = []

@@ -5,10 +5,12 @@ from lightning.pytorch.loggers import WandbLogger
 from model import MusicVAE, get_callbacks
 from dataset import create_dataloaders
 from config_loader import load_config, print_config_types
+import wandb
 
 
 def run_single_training(config_path: str):
     """Run a single training job from a config file."""
+    wandb.finish()
     # Load config
     config = load_config(config_path)
     print("\n=== Config ===")
@@ -57,6 +59,8 @@ def run_single_training(config_path: str):
         print(f"Removed intermediate checkpoint: {ckpt.name}")
 
     print(f"\nCompleted training run: {run_name}\n")
+    wandb.finish()
+    del trainer_config["logger"]
 
 
 def main(config_files: list[str]):
