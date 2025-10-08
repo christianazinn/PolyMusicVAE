@@ -1,0 +1,11 @@
+inherit: default_1024
+name: "24_beta_0.2_1024d_free_bits_24_latent_1024d_lr_1e-5_20_epochs"
+
+model:
+  beta_end: 0.2
+  free_bits: 24
+  latent_dim: 1024
+  learning_rate: 0.00001
+
+trainer:
+  max_epochs: 20

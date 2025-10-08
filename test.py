@@ -99,12 +99,13 @@ def test_latents(model: MusicVAE, num_samples: int = 20):
     print(f"Max:  {similarities.max():.4f}")
 
 def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
+    model.eval()
     score = Score.from_file(path)
     tokenized = tokenizer.encode(score)[0].ids[1:]  # remove BOS
     tensor = torch.tensor(tokenized, dtype=torch.int32).unsqueeze(0).cuda()
     with torch.no_grad():
         latent_dist, _ = model.encode(tensor)
-        reconstructed_ids = model.decode_autoregressive(latent_dist.mean)
+        reconstructed_ids = model.decode_autoregressive(latent_dist.sample())
     reconstructed_score = tokenizer.decode(reconstructed_ids.cpu().numpy()).resample(tpq=4, min_dur=1)
     
     original_pianoroll = score.pianoroll(
@@ -133,11 +134,11 @@ def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
     
 def main():
     tokenizer = REMI()
-    model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
+    model = MusicVAE.load_from_checkpoint("checkpoints/20_beta_0.2_1024d_latent_1024d/last.ckpt")
     # test_interpolate(model, tokenizer, "test/bar_9.mid", "test/bar_17.mid")
     # test_random_noise(model, tokenizer, num_samples=5)
     # test_latents(model, num_samples=1000)
-    test_reconstruction(model, tokenizer, "test/bar_9.mid")
+    test_reconstruction(model, tokenizer, "test/bar_17.mid")
 
 if __name__ == "__main__":
     main()

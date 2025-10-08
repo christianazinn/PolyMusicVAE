@@ -281,7 +281,7 @@ class MusicVAE(L.LightningModule):
             generated = self.decode_autoregressive(z, max_length, temperature)
         return generated
 
-    def interpolate(self, seq1, seq2, num_steps=10):
+    def interpolate(self, seq1, seq2, num_steps=10, do_spherical=False):
         """Interpolate between two sequences in latent space."""
         self.eval()
         with torch.no_grad():
@@ -290,7 +290,18 @@ class MusicVAE(L.LightningModule):
             z2 = self.encode(seq2)[0].mean
 
             # Interpolate in latent space
-            alphas = torch.linspace(0, 1, num_steps, device=self.device)
+            # TODO: is this right? it sucks
+            if do_spherical:
+                alphas = torch.linspace(0, math.pi / 2, num_steps, device=self.device)
+                interpolated = []
+                for alpha in alphas:
+                    z_interp = (
+                        torch.cos(alpha) * z1 + torch.sin(alpha) * z2
+                    ) / math.sqrt(2)
+                    generated = self.decode_autoregressive(z_interp)  # .unsqueeze(0))
+                    interpolated.append(generated)
+            else:
+                alphas = torch.linspace(0, 1, num_steps, device=self.device)
             interpolated = []
 
             for alpha in alphas:
@@ -533,7 +544,7 @@ def get_callbacks():
             monitor="val/total_loss",
             dirpath="checkpoints/",
             filename="music-vae-{epoch:02d}-{val/total_loss:.2f}",
-            save_top_k=10,
+            save_top_k=5,
             mode="min",
             save_last=True,
         ),

@@ -1,0 +1,8 @@
+inherit: default_1024
+name: "22_beta_0.2_1024d_free_bits_24_latent_1024d_lr_1e-5"
+
+model:
+  beta_end: 0.2
+  free_bits: 24
+  latent_dim: 1024
+  learning_rate: 0.00001
