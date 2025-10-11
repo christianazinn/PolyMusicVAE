@@ -10,6 +10,78 @@ from dataset import create_splits
 from model import MusicVAE
 
 
+def interpolate_base(
+    model: MusicVAE,
+    tokenizer: REMI,
+    tensors: list[torch.Tensor],
+    synthesizer,
+    num_steps: int = 10,
+    do_spherical: bool = False,
+    sample_rate: int = 48000,
+    ii: int = -1,
+):
+    interpolated: list[torch.Tensor] = model.interpolate(
+        *tensors, num_steps, do_spherical
+    )
+    interpolated = [tensors[0]] + interpolated + [tensors[1]]
+    scores = [
+        tokenizer.decode(ids.cpu().numpy()).resample(tpq=8, min_dur=1)
+        for ids in interpolated
+    ]
+
+    # render to music
+    # assuming 4/4 time, one bar at 8 ticks/quarter note is 32 ticks, so we assume end_ticks are just multiples of 32
+    concat_score = concat_scores(
+        scores, end_ticks=[(i + 1) * 32 for i in range(len(scores))]
+    )
+    audio_data = synthesizer.render(concat_score, stereo=True)
+    dump_wav(f"test/audio/concatenated_{ii}.wav", audio_data, sample_rate)
+    concat_pianoroll = concat_score.pianoroll(
+        modes=["frame", "onset"], pitch_range=[0, 128], encode_velocity=False
+    )
+
+    # Create figure and plot piano roll data
+    h, w = concat_pianoroll[0, 0].shape
+    n_sections = len(scores)
+
+    # Create background with color gradient
+    cmap = plt.cm.gnuplot
+    adj = 100
+    background = np.zeros((h, w, 3))
+
+    # Calculate section widths (assuming equal spacing at 32 ticks each)
+    section_width = w // n_sections
+    for i in range(n_sections):
+        t = i / (n_sections - 1 + adj)
+        color = cmap(t)[:3]
+        start = i * section_width
+        end = (i + 1) * section_width if i < n_sections - 1 else w
+        background[:, start:end] = color
+
+    # Combine background with piano roll using different colors
+    frame = concat_pianoroll[0, 0]  # sustained notes
+    onset = concat_pianoroll[1, 0]  # note onsets
+
+    final_img = background.copy()
+    # Green/cyan for sustained notes
+    sustained_mask = (frame > 0) & (onset == 0)
+    final_img[sustained_mask] = [1, 1, 1]
+    # Yellow for note onsets
+    onset_mask = onset > 0
+    final_img[onset_mask] = [0, 0.8, 0.6]
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(final_img, origin="lower", aspect="auto", interpolation="nearest")
+    plt.title("Piano Roll")
+    plt.xlabel("Time (ticks)")
+    plt.ylabel("Pitch")
+    plt.tight_layout()
+    plt.savefig(
+        f"test/pianoroll/concatenated_{ii}_ct.png", dpi=300, bbox_inches="tight"
+    )
+    plt.close()
+
+
 def test_interpolate_for(
     model: MusicVAE,
     tokenizer: REMI,
@@ -34,90 +106,20 @@ def test_interpolate_for(
         tensors = [
             torch.tensor(t, dtype=torch.int32).unsqueeze(0).cuda() for t in tokens
         ]
-        interpolated: list[torch.Tensor] = model.interpolate(*tensors, num_steps, do_spherical)
-        interpolated = [tensors[0]] + interpolated + [tensors[1]]
-        scores = [
-            tokenizer.decode(ids.cpu().numpy()).resample(tpq=8, min_dur=1)
-            for ids in interpolated
-        ]
-
-        # render to music
-        # assuming 4/4 time, one bar at 8 ticks/quarter note is 32 ticks, so we assume end_ticks are just multiples of 32
-        concat_score = concat_scores(
-            scores, end_ticks=[(i + 1) * 32 for i in range(len(scores))]
+        interpolate_base(
+            model,
+            tokenizer,
+            tensors,
+            synthesizer,
+            num_steps,
+            do_spherical,
+            sample_rate,
+            ii,
         )
-        audio_data = synthesizer.render(concat_score, stereo=True)
-        dump_wav(f"test/audio/concatenated_{ii}.wav", audio_data, sample_rate)
-        concat_pianoroll = concat_score.pianoroll(
-            modes=["frame", "onset"], pitch_range=[0, 128], encode_velocity=False
-        )
-
-        plt.figure(figsize=(12, 6))
-        plt.imshow(
-            concat_pianoroll[0, 0] + concat_pianoroll[1, 0],
-            origin="lower",
-            aspect="auto",
-            extent=[0, concat_pianoroll.shape[3], 0, 128],
-        )
-        plt.title("Piano Roll (Track 0)")
-        plt.xlabel("Time (in ticks)")
-        plt.ylabel("Pitch (MIDI note number)")
-        # TODO: re-add the background gradient/a way to differentiate sections
-        plt.tight_layout()
-        plt.savefig(
-            f"test/pianoroll/concatenated_{ii}_ct.png", dpi=300, bbox_inches="tight"
-        )
-        plt.close()
 
         # FIXME empty space at the end of a section is a byproduct of training on REMI tokenized data that allows for notes to cross bar boundaries
         # which may or may not even be desirable at all.
         # TODO: ask martin?
-
-"""
-        # create and render piano roll (OLD)
-        piano_rolls = [
-            score.pianoroll(
-                modes=["frame", "onset"], pitch_range=[0, 128], encode_velocity=False
-            )
-            for score in scores
-        ]
-
-        combined = np.concatenate([pr[0, 0] + pr[1, 0] for pr in piano_rolls], axis=1)
-
-        h, w = combined.shape
-        n_rolls = len(piano_rolls)
-
-        # Track actual widths of each piano roll
-        widths = [pr.shape[3] for pr in piano_rolls]
-        cumulative_widths = np.cumsum([0] + widths)
-
-        cmap = plt.cm.gnuplot
-        adj = 100
-
-        background = np.zeros((h, w, 3))
-        for i in range(n_rolls):
-            t = i / (n_rolls - 1 + adj)
-            color = cmap(t)[:3]
-
-            start = cumulative_widths[i]
-            end = cumulative_widths[i + 1]
-            background[:, start:end] = color
-
-        final_img = background.copy()
-        mask = combined > 0
-        final_img[mask] = [1, 1, 1]
-
-        fig, ax = plt.subplots(figsize=(20, 3))
-        ax.imshow(final_img, origin="lower", aspect="auto", interpolation="nearest")
-        ax.set_xlim(0, w)
-        ax.set_ylim(0, h)
-        ax.set_ylabel("Pitch")
-        plt.tight_layout()
-        plt.savefig(
-            f"test/pianoroll/interpolated_{ii}.png", dpi=300, bbox_inches="tight"
-        )
-        plt.close()
-"""
 
 
 if __name__ == "__main__":

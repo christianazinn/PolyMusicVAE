@@ -6,3 +6,4 @@ matplotlib
 datasets
 numpy
 tqdm
+wandb
