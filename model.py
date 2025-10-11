@@ -58,6 +58,7 @@ class MusicVAE(L.LightningModule):
         beta_start: float = 0.0,
         beta_end: float = 1.0,
         beta_warmup_steps: int = 10000,
+        beta_decay_rate: float = 0.99999,
         free_bits: int | None = None,
         lr_schedule: str = "cosine",
         warmup_steps: int = 4000,
@@ -81,6 +82,7 @@ class MusicVAE(L.LightningModule):
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.beta_warmup_steps = beta_warmup_steps
+        self.beta_decay_rate = beta_decay_rate  # only used if beta_warmup_steps=0
         self.free_bits = free_bits
         self.lr_schedule = lr_schedule
         self.warmup_steps = warmup_steps
@@ -136,7 +138,8 @@ class MusicVAE(L.LightningModule):
     def get_beta(self):
         """Get current beta value for KL loss weighting with warmup."""
         if self.beta_warmup_steps == 0:
-            return self.beta_end
+            # exp annealing
+            return self.beta_end * (1 - self.beta_decay_rate**self.training_step_count)
 
         progress = min(1.0, self.training_step_count / self.beta_warmup_steps)
         return self.beta_start + (self.beta_end - self.beta_start) * progress
