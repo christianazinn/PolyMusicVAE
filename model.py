@@ -62,6 +62,8 @@ class MusicVAE(L.LightningModule):
         free_bits: int | None = None,
         lr_schedule: str = "cosine",
         warmup_steps: int = 4000,
+        scheduled_sampling: bool = False,
+        scheduled_sampling_rate: int = 2000,
         **kwargs,
     ):
         super().__init__()
@@ -86,6 +88,8 @@ class MusicVAE(L.LightningModule):
         self.free_bits = free_bits
         self.lr_schedule = lr_schedule
         self.warmup_steps = warmup_steps
+        self.scheduled_sampling = scheduled_sampling
+        self.scheduled_sampling_rate = scheduled_sampling_rate
 
         # tracking
         self._val_latent_means = []
@@ -144,6 +148,16 @@ class MusicVAE(L.LightningModule):
         progress = min(1.0, self.training_step_count / self.beta_warmup_steps)
         return self.beta_start + (self.beta_end - self.beta_start) * progress
 
+    def get_sampling_probability(self):
+        """Get probability of using ground truth (inverse sigmoid schedule)."""
+        if not self.scheduled_sampling or self.scheduled_sampling_rate == 0:
+            return 1.0  # Always use teacher forcing
+
+        k = self.scheduled_sampling_rate
+        i = self.training_step_count
+        epsilon = k / (k + math.exp(i / k))
+        return epsilon
+
     def create_padding_mask(self, sequences):
         """Create padding mask for sequences."""
         return sequences == self.pad_id
@@ -193,6 +207,87 @@ class MusicVAE(L.LightningModule):
         dist = Normal(mu, std)
 
         return dist, encoded
+
+    def decode_scheduled_sampling(self, z, target_sequences):
+        """Decode with scheduled sampling - gradually mix ground truth with predictions."""
+        batch_size, seq_len = target_sequences.shape
+
+        sampling_prob = self.get_sampling_probability()
+
+        # Pre-sample all decisions to avoid building unnecessary computation graphs
+        use_ground_truth = (
+            torch.rand(batch_size, seq_len, device=self.device) < sampling_prob
+        )
+
+        # Build the full input sequence upfront
+        decoder_input_tokens = torch.full(
+            (batch_size, seq_len), self.pad_id, device=self.device
+        )
+        decoder_input_tokens[:, 0] = target_sequences[
+            :, 0
+        ]  # First token is always ground truth
+
+        # Create memory from latent vector
+        memory = self.latent_to_decoder(z).unsqueeze(0)
+
+        # Build input sequence with scheduled sampling
+        for t in range(1, seq_len):
+            # Get input up to current position
+            current_input = torch.cat(
+                [
+                    torch.full((batch_size, 1), self.bos_id, device=self.device),
+                    decoder_input_tokens[:, :t],
+                ],
+                dim=1,
+            )
+
+            # Embed and decode
+            embedded = self.token_embedding(current_input).transpose(0, 1)
+            embedded = self.pos_encoding(embedded)
+
+            curr_len = current_input.shape[1]
+            causal_mask = self.create_causal_mask(curr_len)
+
+            # Decode - detach to prevent gradient flow through sampling decisions
+            with torch.no_grad():
+                decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
+                logits_t = self.output_projection(decoded[-1])
+                probs = F.softmax(logits_t, dim=-1)
+                predicted_token = torch.multinomial(probs, 1).squeeze(-1)
+
+            # Choose between ground truth and prediction
+            ground_truth_token = target_sequences[:, t]
+            next_token = torch.where(
+                use_ground_truth[:, t], ground_truth_token, predicted_token
+            )
+            decoder_input_tokens[:, t] = next_token
+
+        # Now do the actual forward pass with the constructed input sequence
+        decoder_input = torch.cat(
+            [
+                torch.full((batch_size, 1), self.bos_id, device=self.device),
+                decoder_input_tokens[:, :-1],
+            ],
+            dim=1,
+        )
+
+        # Create masks
+        padding_mask = self.create_padding_mask(decoder_input)
+        causal_mask = self.create_causal_mask(seq_len)
+
+        # Embed decoder input
+        embedded = self.token_embedding(decoder_input).transpose(0, 1)
+        embedded = self.pos_encoding(embedded)
+
+        # Decode (this is where gradients flow)
+        decoded = self.decoder(
+            embedded, memory, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask
+        )
+
+        # Project to vocabulary
+        logits = self.output_projection(decoded).transpose(0, 1)
+
+        return logits
 
     def decode_teacher_forcing(self, z, target_sequences):
         """Decode with teacher forcing for training."""
@@ -328,7 +423,10 @@ class MusicVAE(L.LightningModule):
         # Decode
         if target_sequences is not None:
             # Training mode
-            logits = self.decode_teacher_forcing(z, target_sequences)
+            if self.scheduled_sampling and self.training:
+                logits = self.decode_scheduled_sampling(z, target_sequences)
+            else:
+                logits = self.decode_teacher_forcing(z, target_sequences)
             return {
                 "logits": logits,
                 "latent_dist": latent_dist,
@@ -396,6 +494,10 @@ class MusicVAE(L.LightningModule):
         self.log("train/reconstruction_loss", recon_loss, on_step=True, on_epoch=True)
         self.log("train/kl_loss", kl_loss, on_step=True, on_epoch=True)
         self.log("trainer/beta", beta, on_step=True)
+        if self.scheduled_sampling:
+            self.log(
+                "trainer/sampling_prob", self.get_sampling_probability(), on_step=True
+            )
 
         # Update training step counter
         self.training_step_count += 1
