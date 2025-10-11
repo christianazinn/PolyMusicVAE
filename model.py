@@ -3,14 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 import lightning as L
-from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
     LearningRateMonitor,
 )
 import math
-from dataset import create_dataloaders
 
 torch.set_float32_matmul_precision("medium")
 
@@ -30,12 +28,12 @@ class PositionalEncoding(nn.Module):
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0).transpose(0, 1).contiguous()
         self.register_buffer("pe", pe)
 
     def forward(self, x):
         """x: (seq_len, batch_size, d_model)"""
-        x = x + self.pe[: x.size(0), :]
+        x = x + self.pe[: x.size(0), :].clone()
         return self.dropout(x)
 
 
@@ -519,14 +517,16 @@ class MusicVAE(L.LightningModule):
         )
 
         # Log validation metrics
-        self.log("val/total_loss", total_loss, on_epoch=True)
-        self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
-        self.log("val/kl_loss", kl_loss, on_epoch=True)
+        self.log("val/total_loss", total_loss, on_epoch=True, sync_dist=True)
+        self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
+        self.log("val/kl_loss", kl_loss, on_epoch=True, sync_dist=True)
 
         # Store latent means for similarity analysis
         if len(self._val_latent_means) < 100:
-            self._val_latent_means.append(outputs["latent_dist"].mean.detach())
-            self._val_latent_vars.append(outputs["latent_dist"].variance.detach())
+            self._val_latent_means.append(outputs["latent_dist"].mean.detach().clone())
+            self._val_latent_vars.append(
+                outputs["latent_dist"].variance.detach().clone()
+            )
 
         return total_loss
 
@@ -615,26 +615,29 @@ class MusicVAE(L.LightningModule):
         similarities = similarity_matrix[mask]
 
         # Compute statistics
-        self.log("val_sim/mean", similarities.mean())
-        self.log("val_sim/std", similarities.std())
-        self.log("val_sim/min", similarities.min())
-        self.log("val_sim/max", similarities.max())
+        self.log("val_sim/mean", similarities.mean(), sync_dist=True)
+        self.log("val_sim/std", similarities.std(), sync_dist=True)
+        self.log("val_sim/min", similarities.min(), sync_dist=True)
+        self.log("val_sim/max", similarities.max(), sync_dist=True)
 
         # Compute threshold percentages
         total_pairs = len(similarities)
         pct_above_90 = (similarities > 0.9).sum().float() / total_pairs * 100
         pct_above_75 = (similarities > 0.75).sum().float() / total_pairs * 100
 
-        self.log("val_sim/above_0.9_pct", pct_above_90)
-        self.log("val_sim/above_0.75_pct", pct_above_75)
+        self.log("val_sim/above_0.9_pct", pct_above_90, sync_dist=True)
+        self.log("val_sim/above_0.75_pct", pct_above_75, sync_dist=True)
 
         vars = torch.cat(self._val_latent_vars, dim=0)
         self.log(
-            "val_latent/active_units_0.1", (vars.mean(0) > 0.1).sum().to(torch.float32)
+            "val_latent/active_units_0.1",
+            (vars.mean(0) > 0.1).sum().to(torch.float32),
+            sync_dist=True,
         )
         self.log(
             "val_latent/active_units_0.01",
             (vars.mean(0) > 0.01).sum().to(torch.float32),
+            sync_dist=True,
         )
 
         # Clear stored latent means for next epoch

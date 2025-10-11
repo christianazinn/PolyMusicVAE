@@ -3,6 +3,7 @@ name: "27_A40_beta_0.2_512d_free_bits_24_new_data_beta_exp_ss_2000"
 
 data:
   ds_path: "/root/christian/data_nb_1_combined"
+  batch_size: 256
 
 model:
   beta_end: 0.2

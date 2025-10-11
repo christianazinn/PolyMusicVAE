@@ -38,6 +38,10 @@ def run_single_training(config_path: str):
 
     import lightning as L
 
+    # hack to get it to work on the 8xA40 node
+    # from lightning.pytorch.strategies import DDPStrategy
+    # strategy = DDPStrategy(broadcast_buffers=False)
+    # trainer_config["strategy"] = strategy
     trainer = L.Trainer(**trainer_config)
 
     trainer.fit(model, train_loader, val_loader)
