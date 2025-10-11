@@ -16,7 +16,7 @@ echo "Creating tmux session $SESSION_NAME"
 echo ""
 
 tmux new-session -d -s "$SESSION_NAME" -n "subfolder-${subfolders[0]}"
-tmux send-keys -t "$SESSION_NAME:subfolder-${subfolders[0]}" "source ../.venv/bin/activate && python preprocess_subfolder.py ${subfolders[0]} $NUM_BARS $MAX_SEQ_LEN" Enter
+tmux send-keys -t "$SESSION_NAME:subfolder-${subfolders[0]}" "source ../../.venv/bin/activate && python preprocess_subfolder.py ${subfolders[0]} $NUM_BARS $MAX_SEQ_LEN && exit" Enter
 
 for i in "${!subfolders[@]}"; do
     if [ $i -eq 0 ]; then
@@ -29,7 +29,7 @@ for i in "${!subfolders[@]}"; do
     echo "Creating window: $window_name"
     
     tmux new-window -t "$SESSION_NAME" -n "$window_name"
-    tmux send-keys -t "$SESSION_NAME:$window_name" "source ../.venv/bin/activate && python preprocess_subfolder.py $subfolder $NUM_BARS $MAX_SEQ_LEN" Enter
+    tmux send-keys -t "$SESSION_NAME:$window_name" "source ../../.venv/bin/activate && python preprocess_subfolder.py $subfolder $NUM_BARS $MAX_SEQ_LEN && exit" Enter
 done
 
 echo ""

@@ -126,7 +126,7 @@ if __name__ == "__main__":
     )
     tokenizer = REMI()
     model = MusicVAE.load_from_checkpoint(
-        "checkpoints/23_beta_0.1_512d_free_bits_24/last.ckpt"
+        "checkpoints/24_beta_0.2_1024d_free_bits_24_latent_1024d_lr_1e-5_20_epochs/last.ckpt"
     )
     model.eval()
     # model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")

@@ -1,0 +1,12 @@
+inherit: default_512
+name: "25_beta_0.2_512d_free_bits_24_new_data"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1_combined"
+
+model:
+  beta_end: 0.2
+  free_bits: 24
+
+trainer:
+  max_epochs: 1

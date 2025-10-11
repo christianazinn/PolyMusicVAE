@@ -107,7 +107,7 @@ def main():
     before_len = len(file_paths)
     with open(os.path.dirname(__file__) + "/lakh_good_martin.json", "r") as f:
         good_files = set(json.load(f))
-    file_paths = [fp for fp in file_paths if fp.name.strip(".mid") in good_files]
+    file_paths = [fp for fp in file_paths if fp.name.rstrip(".mid") in good_files]
     print(f"Globbed {len(file_paths)} files (originally {before_len}). Processing...")
 
     if split in ["e", ""]:
