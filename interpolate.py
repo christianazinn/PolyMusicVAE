@@ -20,6 +20,7 @@ def interpolate_base(
     sample_rate: int = 48000,
     ii: int = -1,
 ):
+    model.eval()
     interpolated: list[torch.Tensor] = model.interpolate(
         *tensors, num_steps, do_spherical
     )
@@ -127,9 +128,7 @@ if __name__ == "__main__":
         ds_path="/home/christian/vae/data_nb_1/b", val_split=0.0, test_split=0.0
     )
     tokenizer = REMI()
-    model = MusicVAE.load_from_checkpoint(
-        "checkpoints/24_beta_0.2_1024d_free_bits_24_latent_1024d_lr_1e-5_20_epochs/last.ckpt"
-    )
+    model = MusicVAE.load_id(25)
     model.eval()
     # model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
     test_interpolate_for(model, tokenizer, ds, iiter=10, do_spherical=False)

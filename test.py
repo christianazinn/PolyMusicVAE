@@ -26,9 +26,7 @@ def test_interpolate(
         sf_path=BuiltInSF3.MuseScoreGeneral().path(download=True),
         sample_rate=48000,
     )
-    interpolate_base(
-        model, tokenizer, tensors, synthesizer, num_steps, do_spherical=True
-    )
+    interpolate_base(model, tokenizer, tensors, synthesizer, num_steps)
 
 
 # does the decoder work fine with random noise? posterior collapse
@@ -112,10 +110,12 @@ def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
         latent_dist, _ = model.encode(tensor)
         reconstructed_ids = model.decode_autoregressive(latent_dist.sample())
     reconstructed_score = tokenizer.decode(reconstructed_ids.cpu().numpy()).resample(
-        tpq=4, min_dur=1
+        tpq=8, min_dur=1
     )
 
-    original_pianoroll = score.pianoroll(
+    xscore = tokenizer.decode(tensor.cpu().numpy()).resample(tpq=8, min_dur=1)
+
+    original_pianoroll = xscore.pianoroll(
         modes=["frame", "onset"], pitch_range=[0, 128], encode_velocity=False
     )
     reconstructed_pianoroll = reconstructed_score.pianoroll(
@@ -144,9 +144,8 @@ def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
 
 def main():
     tokenizer = REMI()
-    model = MusicVAE.load_from_checkpoint(
-        "checkpoints/24_beta_0.2_1024d_free_bits_24_latent_1024d_lr_1e-5_20_epochs/last.ckpt"
-    )
+    model = MusicVAE.load_id(25)
+    model.eval()
     test_interpolate(
         model,
         tokenizer,
@@ -155,7 +154,7 @@ def main():
     )
     # test_random_noise(model, tokenizer, num_samples=5)
     # test_latents(model, num_samples=1000)
-    # test_reconstruction(model, tokenizer, "test/bar_17.mid")
+    # test_reconstruction(model, tokenizer, "test/bar_9.mid")
 
 
 if __name__ == "__main__":

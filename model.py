@@ -9,6 +9,7 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
 )
 import math
+from pathlib import Path
 
 torch.set_float32_matmul_precision("medium")
 
@@ -643,6 +644,21 @@ class MusicVAE(L.LightningModule):
         # Clear stored latent means for next epoch
         self._val_latent_means = []
         self._val_latent_vars = []
+
+    @classmethod
+    def load_id(cls, run_id: int, checkpoints_dir: str = "checkpoints"):
+        """Load checkpoint by run ID number."""
+        # Find folder starting with the run_id
+        checkpoint_path = Path(checkpoints_dir)
+        matching = list(checkpoint_path.glob(f"{run_id}_*"))
+
+        if not matching:
+            raise FileNotFoundError(f"No checkpoint folder found for run_id {run_id}")
+        if len(matching) > 1:
+            raise ValueError(f"Multiple folders found for run_id {run_id}: {matching}")
+
+        ckpt_file = matching[0] / "last.ckpt"
+        return cls.load_from_checkpoint(str(ckpt_file))
 
 
 def get_callbacks():
