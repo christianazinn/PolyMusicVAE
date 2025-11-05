@@ -1,0 +1,5 @@
+inherit: default_1024
+name: "17_beta_0.2_1024d"
+
+model:
+  beta_end: 0.2

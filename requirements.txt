@@ -1,0 +1,9 @@
+torch
+lightning
+symusic
+miditok
+matplotlib
+datasets
+numpy
+tqdm
+wandb

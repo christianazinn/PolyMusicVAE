@@ -1,0 +1,8 @@
+inherit: base
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_encoder_layers: 6
+  n_decoder_layers: 6
+  latent_dim: 512
