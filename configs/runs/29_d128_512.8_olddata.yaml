@@ -1,0 +1,17 @@
+inherit: default_512
+name: "29_ugh_d128_try_512/8"
+
+model:
+  d_model: 512
+  n_heads: 8
+  latent_dim: 128
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1_combined"
+
+model:
+  beta_end: 0.2
+  free_bits: 6
+
+trainer:
+  max_epochs: 1

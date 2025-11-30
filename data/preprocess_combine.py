@@ -5,8 +5,8 @@ from tqdm import tqdm
 
 def main():
     subfolders = [str(i) for i in range(10)] + ["a", "b", "c", "d", "e", "f"]
-    base_data_path = Path("/home/christian/vae/data_nb_1")
-    output_path = Path("/home/christian/vae/data_nb_1_combined")
+    base_data_path = Path("/home/christian/vae/data_nb_1a")
+    output_path = Path("/home/christian/vae/data_nb_1a_combined")
     input_folders = [base_data_path / subfolder for subfolder in subfolders]
 
     datasets = []

@@ -26,8 +26,9 @@ def preprocess_file(midi_file: str | Path, tokenizer: REMI, config: PreprocessCo
     tokens = tokenizer.encode(score)
     if type(tokens) is not list:
         tokens = [tokens]
+    # this gives us a list of TokSequences that each correspond to a track in the MIDI file
 
-    # extract all nonempty num_bars segments from the file
+    # extract all nonempty num_bars segments from the file (which is 1 for our purposes)
     for tokseq in tokens:
         assert type(tokseq) is TokSequence
         ids = np.array(tokseq.ids)
@@ -38,8 +39,9 @@ def preprocess_file(midi_file: str | Path, tokenizer: REMI, config: PreprocessCo
             end = bar_breaks[i + config.num_bars]
             tolist = ids[start:end].tolist() + [config.eos_id]
             if (
-                len(tolist) > config.num_bars + 1
-                and len(tolist) <= config.max_seq_len - 1
+                (len(tolist) > config.num_bars + 1  # TODO: maybe undesirable, since the model doesn't know how to handle empty bars
+                or np.random.rand() < 0.2)  # see post hoc how bad this is
+                and len(tolist) <= config.max_seq_len - 1  # otoh this should be fine, analytics show almost no samples exceed max_seq_len
             ):  # room for BOS
                 yield tolist
 
@@ -99,7 +101,7 @@ def main():
 
     data_path = Path(f"/mnt/t/midi/lmd_full/{split}")
     # b/c of how it's launched, safer to abspath
-    out_path = Path(f"/home/christian/vae/data_nb_{num_bars}/{split}")
+    out_path = Path(f"/home/christian/vae/data_nb_{num_bars}a/{split}")
     out_path.mkdir(exist_ok=True, parents=True)
 
     print("Globbing...")
