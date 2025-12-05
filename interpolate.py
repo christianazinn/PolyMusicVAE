@@ -125,10 +125,10 @@ def test_interpolate_for(
 
 if __name__ == "__main__":
     ds, _, _, _ = create_splits(
-        ds_path="/home/christian/vae/data_nb_1/b", val_split=0.0, test_split=0.0
+        ds_path="/home/christian/vae/data_nb_1/a", val_split=0.0, test_split=0.0
     )
     tokenizer = REMI()
-    model = MusicVAE.load_id(25)
+    model = MusicVAE.load_id(33)
     model.eval()
     # model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
     test_interpolate_for(model, tokenizer, ds, iiter=10, do_spherical=False)

@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from datasets import load_from_disk, Dataset as HFDataset
 from os import PathLike
@@ -73,6 +73,27 @@ def create_splits(
     )
 
 
+
+def create_length_weighted_sampler(dataset, power=0.0):
+    """Create a sampler that oversamples longer sequences.
+    
+    Args:
+        power: Controls oversampling strength. Higher = more aggressive.
+               power=1.0 is linear, power=2.0 is quadratic, etc.
+    """
+    lengths = [len(dataset.ds[i]["s"]) for i in range(len(dataset))]
+    
+    # Weight by length raised to some power
+    weights = [length ** power for length in lengths]
+    
+    return WeightedRandomSampler(
+        weights=weights,
+        # TODO can tune if you like
+        num_samples=len(dataset),
+        replacement=True
+    )
+
+
 def create_dataloaders(
     ds_path: PathLike,
     batch_size: int = 32,
@@ -81,14 +102,11 @@ def create_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     pin_memory: bool = True,
+    sampler_power: float = 0.0,
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], Dict]:
     train_hf, val_hf, test_hf, config = create_splits(
         ds_path, val_split, test_split, seed
     )
-
-    train_dataset = MusicDataset(train_hf)
-    val_dataset = MusicDataset(val_hf) if val_hf else None
-    test_dataset = MusicDataset(test_hf) if test_hf else None
 
     collate_func = lambda batch: collate_fn(batch, config["pad_id"])
     dl_kwargs = {
@@ -98,14 +116,22 @@ def create_dataloaders(
         "collate_fn": collate_func,
     }
 
-    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **dl_kwargs)
+    assert sampler_power > 0.0, "testing, this should be passed through"
 
-    val_loader = (
-        DataLoader(val_dataset, shuffle=False, **dl_kwargs) if val_dataset else None
-    )
-
-    test_loader = (
-        DataLoader(test_dataset, shuffle=False, **dl_kwargs) if test_dataset else None
-    )
+    train_dataset = MusicDataset(train_hf)
+    train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
+    train_loader = DataLoader(train_dataset, sampler=train_sampler, drop_last=True, **dl_kwargs)
+    if val_hf:
+        val_dataset = MusicDataset(val_hf)
+        val_sampler = create_length_weighted_sampler(val_dataset, sampler_power)
+        val_loader = (
+            DataLoader(val_dataset, sampler=val_sampler, **dl_kwargs)
+        )
+    if test_hf:
+        test_dataset = MusicDataset(test_hf)
+        test_sampler = create_length_weighted_sampler(test_dataset, sampler_power)
+        test_loader = (
+            DataLoader(test_dataset, sampler=test_sampler, **dl_kwargs)
+        )
 
     return train_loader, val_loader, test_loader, config

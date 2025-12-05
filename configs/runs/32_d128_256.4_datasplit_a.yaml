@@ -1,0 +1,17 @@
+inherit: base
+name: "32_ugh_d128_try"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1a_combined"
+
+model:
+  d_model: 256
+  n_heads: 4
+  n_encoder_layers: 6
+  n_decoder_layers: 6
+  latent_dim: 128
+  beta_end: 0.2
+  free_bits: 6
+
+trainer:
+  max_epochs: 1
