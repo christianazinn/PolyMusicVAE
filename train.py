@@ -42,7 +42,7 @@ def run_single_training(config_path: str):
     # from lightning.pytorch.strategies import DDPStrategy
     # strategy = DDPStrategy(broadcast_buffers=False)
     # trainer_config["strategy"] = strategy
-    trainer = L.Trainer(**trainer_config)
+    trainer = L.Trainer(use_distributed_sampler=False, **trainer_config)
 
     trainer.fit(model, train_loader, val_loader)
 
@@ -58,9 +58,9 @@ def run_single_training(config_path: str):
         print(f"Moved last.ckpt to {run_dir}")
 
     # Remove intermediate checkpoints (keep only last.ckpt in run folder)
-    for ckpt in checkpoint_dir.glob("music-vae-epoch=*-val"):
-        ckpt.unlink()
-        print(f"Removed intermediate checkpoint: {ckpt.name}")
+    # for ckpt in checkpoint_dir.glob("music-vae-epoch=*-val"):
+    #     ckpt.unlink()
+    #     print(f"Removed intermediate checkpoint: {ckpt.name}")
 
     print(f"\nCompleted training run: {run_name}\n")
     wandb.finish()
@@ -109,6 +109,7 @@ def main(config_files: list[str]):
         try:
             run_single_training(config_path)
         except Exception as e:
+            # raise e
             print(f"ERROR in {config_path}: {e}")
             print("Continuing to next run...")
             continue

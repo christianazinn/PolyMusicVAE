@@ -73,6 +73,8 @@ class MusicVAE(L.LightningModule):
         self.d_model = d_model
         self.latent_dim = latent_dim
         self.max_seq_len = max_seq_len
+        # for now...
+        assert self.max_seq_len == 256
         self.pad_id = pad_id
         self.bos_id = bos_id
         self.eos_id = eos_id
@@ -521,6 +523,63 @@ class MusicVAE(L.LightningModule):
         self.log("val/total_loss", total_loss, on_epoch=True, sync_dist=True)
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
         self.log("val/kl_loss", kl_loss, on_epoch=True, sync_dist=True)
+
+        latent_mean = outputs["latent_dist"].mean
+        latent_std = outputs["latent_dist"].stddev
+
+        self.log(
+            "val/latent_mean_abs_mean",
+            latent_mean.abs().mean(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val/latent_std_mean", latent_std.mean(), on_epoch=True, sync_dist=True
+        )
+        self.log(
+            "val/latent_mean_abs_max",
+            latent_mean.abs().max(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        # Compute per-position cross entropy
+        logits = outputs["logits"]  # (batch, seq_len, vocab)
+        per_token_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            target_sequences.reshape(-1),
+            ignore_index=self.pad_id,
+            reduction="none",
+        ).reshape(target_sequences.shape)  # (batch, seq_len)
+
+        # Average across batch for each position
+        # Mask out padding positions
+        mask = target_sequences != self.pad_id
+        masked_loss = per_token_loss * mask
+        position_loss = masked_loss.sum(dim=0) / mask.sum(dim=0).clamp(min=1)
+
+        # Log losses at key positions
+        seq_len = position_loss.shape[0]
+        if seq_len > 50:
+            self.log(
+                "val/loss_pos_50", position_loss[49], on_epoch=True, sync_dist=True
+            )
+        if seq_len > 100:
+            self.log(
+                "val/loss_pos_100", position_loss[99], on_epoch=True, sync_dist=True
+            )
+        if seq_len > 150:
+            self.log(
+                "val/loss_pos_150", position_loss[149], on_epoch=True, sync_dist=True
+            )
+        if seq_len > 200:
+            self.log(
+                "val/loss_pos_200", position_loss[199], on_epoch=True, sync_dist=True
+            )
+        if seq_len > 250:
+            self.log(
+                "val/loss_pos_250", position_loss[199], on_epoch=True, sync_dist=True
+            )
 
         # Store latent means for similarity analysis
         if len(self._val_latent_means) < 100:

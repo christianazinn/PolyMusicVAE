@@ -5,6 +5,7 @@ from datasets import load_from_disk, Dataset as HFDataset
 from os import PathLike
 from typing import Dict, List, Optional, Tuple
 import json
+import pickle
 
 
 class MusicDataset(Dataset):
@@ -73,24 +74,18 @@ def create_splits(
     )
 
 
+def create_length_weighted_sampler(dataset, power=0.0, max_samples=2**24 - 1):
+    lengths = [len(dataset.ds[i]["s"]) for i in range(len(dataset))][:max_samples]
+    weights = [length**power for length in lengths]
 
-def create_length_weighted_sampler(dataset, power=0.0):
-    """Create a sampler that oversamples longer sequences.
-    
-    Args:
-        power: Controls oversampling strength. Higher = more aggressive.
-               power=1.0 is linear, power=2.0 is quadratic, etc.
-    """
-    lengths = [len(dataset.ds[i]["s"]) for i in range(len(dataset))]
-    
-    # Weight by length raised to some power
-    weights = [length ** power for length in lengths]
-    
+    # Use fewer samples than dataset size
+    num_samples = min(len(dataset), max_samples)
+
     return WeightedRandomSampler(
         weights=weights,
-        # TODO can tune if you like
-        num_samples=len(dataset),
-        replacement=True
+        # TODO cannot be over 2**24 - 1 due to some PyTorch limitation
+        num_samples=num_samples,
+        replacement=True,
     )
 
 
@@ -119,19 +114,25 @@ def create_dataloaders(
     assert sampler_power > 0.0, "testing, this should be passed through"
 
     train_dataset = MusicDataset(train_hf)
-    train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
-    train_loader = DataLoader(train_dataset, sampler=train_sampler, drop_last=True, **dl_kwargs)
+    try:
+        with open(f"data/train_sampler_power_{sampler_power}.pkl", "rb") as f:
+            train_sampler = pickle.load(f)
+    except FileNotFoundError:
+        train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
+        with open(f"data/train_sampler_power_{sampler_power}.pkl", "wb") as f:
+            pickle.dump(train_sampler, f)
+    train_loader = DataLoader(
+        train_dataset, sampler=train_sampler, drop_last=True, **dl_kwargs
+    )
     if val_hf:
         val_dataset = MusicDataset(val_hf)
-        val_sampler = create_length_weighted_sampler(val_dataset, sampler_power)
-        val_loader = (
-            DataLoader(val_dataset, sampler=val_sampler, **dl_kwargs)
-        )
+        val_loader = DataLoader(val_dataset, shuffle=False, **dl_kwargs)
+    else:
+        val_loader = None
     if test_hf:
         test_dataset = MusicDataset(test_hf)
-        test_sampler = create_length_weighted_sampler(test_dataset, sampler_power)
-        test_loader = (
-            DataLoader(test_dataset, sampler=test_sampler, **dl_kwargs)
-        )
+        test_loader = DataLoader(test_dataset, shuffle=False, **dl_kwargs)
+    else:
+        test_loader = None
 
     return train_loader, val_loader, test_loader, config
