@@ -5,6 +5,7 @@ from lightning.pytorch.loggers import WandbLogger
 from model import MusicVAE, get_callbacks
 from dataset import create_dataloaders
 from config_loader import load_config, print_config_types
+import lightning as L
 import wandb
 
 
@@ -35,8 +36,6 @@ def run_single_training(config_path: str):
         project="music-vae", name=run_name, log_model=True
     )
     trainer_config["callbacks"] = get_callbacks()
-
-    import lightning as L
 
     # hack to get it to work on the 8xA40 node
     # from lightning.pytorch.strategies import DDPStrategy

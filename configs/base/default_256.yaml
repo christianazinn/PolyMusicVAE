@@ -1,0 +1,10 @@
+inherit: base
+
+data:
+  batch_size: 128
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 4
