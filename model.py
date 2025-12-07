@@ -38,374 +38,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class AdaLNZero(nn.Module):
-    """Adaptive Layer Norm with zero-initialized output scaling.
-
-    Replaces standard LayerNorm, conditioning the normalization on latent z.
-    adaLN(x, z) = γ(z) * LayerNorm(x) + β(z)
-
-    The α parameter gates the residual connection and is zero-initialized
-    for stable training.
-    """
-
-    def __init__(self, d_model, latent_dim):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-        # Project latent to scale, shift, and residual gate
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(latent_dim, 3 * d_model)
-        )
-        # Zero-initialize the final linear layer for stability
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
-
-    def forward(self, x, z):
-        """
-        x: (seq_len, batch, d_model) or (batch, seq_len, d_model)
-        z: (batch, latent_dim)
-        Returns: normalized x, alpha for residual gating
-        """
-        # Get modulation parameters from z
-        shift, scale, alpha = self.adaLN_modulation(z).chunk(3, dim=-1)
-
-        # Handle both seq-first and batch-first formats
-        if x.dim() == 3 and x.shape[1] != z.shape[0]:
-            # x is (seq_len, batch, d_model), need to broadcast
-            shift = shift.unsqueeze(0)  # (1, batch, d_model)
-            scale = scale.unsqueeze(0)
-            alpha = alpha.unsqueeze(0)
-        elif x.dim() == 3 and x.shape[0] == z.shape[0]:
-            # x is (batch, seq_len, d_model)
-            shift = shift.unsqueeze(1)  # (batch, 1, d_model)
-            scale = scale.unsqueeze(1)
-            alpha = alpha.unsqueeze(1)
-
-        x_norm = self.norm(x)
-        x_mod = x_norm * (1 + scale) + shift
-        return x_mod, alpha
-
-
-class AdaLNTransformerDecoderLayer(nn.Module):
-    """Transformer decoder layer with adaLN-Zero conditioning.
-
-    Replaces standard LayerNorm with adaptive normalization conditioned on z.
-    """
-
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, latent_dim):
-        super().__init__()
-
-        # Self attention
-        self.self_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=False
-        )
-
-        # Cross attention to memory
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=False
-        )
-
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
-        )
-
-        # adaLN for each sub-layer
-        self.adaln1 = AdaLNZero(d_model, latent_dim)
-        self.adaln2 = AdaLNZero(d_model, latent_dim)
-        self.adaln3 = AdaLNZero(d_model, latent_dim)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, tgt, memory, z, tgt_mask=None, tgt_key_padding_mask=None):
-        """
-        tgt: (seq_len, batch, d_model)
-        memory: (mem_len, batch, d_model)
-        z: (batch, latent_dim)
-        """
-        # Self attention with adaLN
-        tgt_norm, alpha1 = self.adaln1(tgt, z)
-        self_attn_out, _ = self.self_attn(
-            tgt_norm,
-            tgt_norm,
-            tgt_norm,
-            attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask,
-        )
-        tgt = tgt + alpha1 * self.dropout(self_attn_out)
-
-        # Cross attention with adaLN
-        tgt_norm, alpha2 = self.adaln2(tgt, z)
-        cross_attn_out, _ = self.cross_attn(tgt_norm, memory, memory)
-        tgt = tgt + alpha2 * self.dropout(cross_attn_out)
-
-        # FFN with adaLN
-        tgt_norm, alpha3 = self.adaln3(tgt, z)
-        ffn_out = self.ffn(tgt_norm)
-        tgt = tgt + alpha3 * ffn_out
-
-        return tgt
-
-
-class AdaLNTransformerDecoder(nn.Module):
-    """Stack of AdaLN decoder layers."""
-
-    def __init__(
-        self, d_model, nhead, dim_feedforward, dropout, latent_dim, num_layers
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                AdaLNTransformerDecoderLayer(
-                    d_model, nhead, dim_feedforward, dropout, latent_dim
-                )
-                for _ in range(num_layers)
-            ]
-        )
-
-    def forward(self, tgt, memory, z, tgt_mask=None, tgt_key_padding_mask=None):
-        output = tgt
-        for layer in self.layers:
-            output = layer(output, memory, z, tgt_mask, tgt_key_padding_mask)
-        return output
-
-
-class ChunkedLocalDecoderLayer(nn.Module):
-    """Decoder layer with chunk-local self-attention.
-
-    Self-attention is restricted to within-chunk only (block-diagonal mask),
-    forcing global/cross-chunk information to flow through conductor embeddings.
-    Cross-attention attends to per-chunk conductor embeddings.
-    """
-
-    def __init__(self, d_model, nhead, dim_feedforward, dropout):
-        super().__init__()
-
-        self.self_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=False
-        )
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=False
-        )
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
-        )
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, tgt, conductor_embeds, chunk_mask, tgt_key_padding_mask=None):
-        """
-        tgt: (seq_len, batch, d_model)
-        conductor_embeds: (seq_len, batch, d_model) - per-position conductor embeddings
-        chunk_mask: (seq_len, seq_len) - block-diagonal + causal mask
-        """
-        # Self attention (chunk-local only due to mask)
-        tgt_norm = self.norm1(tgt)
-        assert not torch.isnan(tgt_norm).any(), "tgt_norm nan"
-        self_attn_out, _ = self.self_attn(
-            tgt_norm,
-            tgt_norm,
-            tgt_norm,
-            attn_mask=chunk_mask,
-            key_padding_mask=tgt_key_padding_mask,
-        )
-
-        # Replace NaNs from fully-masked rows (padding positions)
-        self_attn_out = torch.nan_to_num(self_attn_out, nan=0.0)
-        assert not torch.isnan(self_attn_out).any(), "sao nan"
-
-        tgt = tgt + self.dropout(self_attn_out)
-        assert not torch.isnan(tgt).any(), "tgt1 nan"
-
-        # Cross attention to conductor embeddings
-        # Each position attends to its corresponding conductor embedding
-        tgt_norm = self.norm2(tgt)
-        assert not torch.isnan(tgt_norm).any(), "tgt_norm2 nan"
-
-        cross_attn_out, _ = self.cross_attn(
-            tgt_norm, conductor_embeds, conductor_embeds
-        )
-        assert not torch.isnan(self_attn_out).any(), "xao nan"
-        tgt = tgt + self.dropout(cross_attn_out)
-        assert not torch.isnan(tgt).any(), "tgt2 nan"
-
-        # FFN
-        tgt_norm = self.norm3(tgt)
-        assert not torch.isnan(tgt_norm).any(), "tgt_norm3 nan"
-        ffn_out = self.ffn(tgt_norm)
-        assert not torch.isnan(ffn_out).any(), "ffn nan"
-        tgt = tgt + ffn_out
-        assert not torch.isnan(tgt).any(), "tgt3 nan"
-
-        return tgt
-
-
-class ChunkedLocalDecoder(nn.Module):
-    """Hierarchical decoder with fixed-size chunk processing.
-
-    Each chunk of 16 tokens is processed independently with full causal attention.
-    Chunks that are entirely padding are skipped.
-    Global info flows through z -> conductor -> per-chunk embeddings.
-    """
-
-    def __init__(
-        self,
-        d_model,
-        nhead,
-        dim_feedforward,
-        dropout,
-        latent_dim,
-        num_layers,
-        chunk_size=16,
-        max_seq_len=256,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.chunk_size = chunk_size
-        self.max_chunks = (max_seq_len + chunk_size - 1) // chunk_size
-
-        # Conductor: z -> per-chunk embeddings
-        self.conductor_embed = nn.Parameter(torch.zeros(self.max_chunks, d_model))
-        self.conductor_proj = nn.Sequential(
-            nn.Linear(latent_dim, d_model), nn.LayerNorm(d_model)
-        )
-        self.conductor_layers = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=False,
-            ),
-            num_layers=2,
-        )
-        self.conductor_out = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.LayerNorm(d_model)
-        )
-
-        # Chunk-local decoder layers (standard transformer decoder)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=False,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
-
-        # Cache causal mask for chunk_size
-        self.register_buffer(
-            "_causal_mask",
-            torch.triu(torch.ones(chunk_size, chunk_size), diagonal=1).bool(),
-        )
-
-    def get_conductor_embeddings(self, z, num_chunks):
-        """Generate per-chunk conductor embeddings from latent z."""
-        batch_size = z.shape[0]
-
-        z_proj = self.conductor_proj(z)  # (batch, d_model)
-        chunk_embeds = self.conductor_embed[:num_chunks].unsqueeze(
-            1
-        )  # (num_chunks, 1, d_model)
-        chunk_embeds = chunk_embeds.expand(
-            -1, batch_size, -1
-        ).clone()  # (num_chunks, batch, d_model)
-        chunk_embeds = chunk_embeds + z_proj.unsqueeze(0)
-        chunk_embeds = F.layer_norm(chunk_embeds, [self.d_model])
-
-        chunk_embeds = self.conductor_layers(chunk_embeds)
-        chunk_embeds = self.conductor_out(chunk_embeds)
-
-        return chunk_embeds  # (num_chunks, batch, d_model)
-
-    def forward(self, tgt, z, tgt_key_padding_mask=None):
-        """
-        tgt: (seq_len, batch, d_model)
-        z: (batch, latent_dim)
-        tgt_key_padding_mask: (batch, seq_len) - True means padding
-        """
-        seq_len, batch_size, _ = tgt.shape
-        device = tgt.device
-
-        num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
-
-        # Get conductor embeddings for each chunk
-        conductor_embeds = self.get_conductor_embeddings(
-            z, num_chunks
-        )  # (num_chunks, batch, d_model)
-
-        # Process each chunk independently
-        output_chunks = []
-
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * self.chunk_size
-            end = min(start + self.chunk_size, seq_len)
-            chunk_len = end - start
-
-            # Extract chunk
-            chunk_tgt = tgt[start:end]  # (chunk_len, batch, d_model)
-
-            # Check which batch elements have this chunk entirely padded
-            if tgt_key_padding_mask is not None:
-                chunk_padding = tgt_key_padding_mask[:, start:end]  # (batch, chunk_len)
-                entirely_padded = chunk_padding.all(dim=1)  # (batch,)
-            else:
-                entirely_padded = torch.zeros(
-                    batch_size, dtype=torch.bool, device=device
-                )
-
-            # Get conductor embedding for this chunk as memory
-            chunk_memory = conductor_embeds[
-                chunk_idx : chunk_idx + 1
-            ]  # (1, batch, d_model)
-
-            # Create causal mask for this chunk
-            if chunk_len == self.chunk_size:
-                causal_mask = self._causal_mask
-            else:
-                causal_mask = torch.triu(
-                    torch.ones(chunk_len, chunk_len, device=device), diagonal=1
-                ).bool()
-
-            # Decode chunk
-            if entirely_padded.all():
-                # Skip entirely - just pass through zeros
-                chunk_out = torch.zeros_like(chunk_tgt)
-            else:
-                chunk_padding_mask = (
-                    chunk_padding if tgt_key_padding_mask is not None else None
-                )
-                chunk_out = self.decoder(
-                    chunk_tgt,
-                    chunk_memory,
-                    tgt_mask=causal_mask,
-                    tgt_key_padding_mask=chunk_padding_mask,
-                )
-                # Zero out entirely padded batch elements
-                if entirely_padded.any():
-                    chunk_out[:, entirely_padded] = 0
-
-            output_chunks.append(chunk_out)
-
-        # Concatenate chunks back together
-        output = torch.cat(output_chunks, dim=0)  # (seq_len, batch, d_model)
-
-        return output
-
-
 class MusicVAE(L.LightningModule):
     def __init__(
         self,
@@ -426,20 +58,10 @@ class MusicVAE(L.LightningModule):
         beta_end: float = 1.0,
         beta_warmup_steps: int = 10000,
         beta_decay_rate: float = 0.99999,
-        free_bits: float | None = None,
+        free_bits: int | None = None,
         lr_schedule: str = "cosine",
         warmup_steps: int = 4000,
-        scheduled_sampling: bool = False,
-        scheduled_sampling_rate: int = 2000,
-        # New parameters for posterior collapse prevention
-        use_adaln: bool = True,
-        num_memory_tokens: int = 8,
         input_dropout: float = 0.0,
-        cyclical_annealing: bool = False,
-        n_cycles: int = 4,
-        # Hierarchical/chunked decoder (MusicVAE-style)
-        use_chunked_decoder: bool = False,
-        chunk_size: int = 16,
         **kwargs,
     ):
         super().__init__()
@@ -450,6 +72,8 @@ class MusicVAE(L.LightningModule):
         self.d_model = d_model
         self.latent_dim = latent_dim
         self.max_seq_len = max_seq_len
+        # for now...
+        assert self.max_seq_len == 256
         self.pad_id = pad_id
         self.bos_id = bos_id
         self.eos_id = eos_id
@@ -460,21 +84,11 @@ class MusicVAE(L.LightningModule):
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.beta_warmup_steps = beta_warmup_steps
-        self.beta_decay_rate = beta_decay_rate
+        self.beta_decay_rate = beta_decay_rate  # only used if beta_warmup_steps=0
         self.free_bits = free_bits
         self.lr_schedule = lr_schedule
         self.warmup_steps = warmup_steps
-        self.scheduled_sampling = scheduled_sampling
-        self.scheduled_sampling_rate = scheduled_sampling_rate
-
-        # Posterior collapse prevention
-        self.use_adaln = use_adaln
-        self.num_memory_tokens = num_memory_tokens
         self.input_dropout = input_dropout
-        self.cyclical_annealing = cyclical_annealing
-        self.n_cycles = n_cycles
-        self.use_chunked_decoder = use_chunked_decoder
-        self.chunk_size = chunk_size
 
         # tracking
         self._val_latent_means = []
@@ -484,7 +98,6 @@ class MusicVAE(L.LightningModule):
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
 
-        # Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -496,45 +109,17 @@ class MusicVAE(L.LightningModule):
         self.encoder = nn.TransformerEncoder(encoder_layer, n_encoder_layers)
 
         self.encoder_to_latent = nn.Linear(d_model, latent_dim * 2)  # mu and logvar
-
-        # Multi-token memory: expand latent to multiple memory tokens
-        self.latent_to_memory = nn.Linear(latent_dim, num_memory_tokens * d_model)
-
-        # Also keep direct latent projection for adaLN
         self.latent_to_decoder = nn.Linear(latent_dim, d_model)
 
-        # Decoder - choose architecture based on flags
-        # Priority: chunked > adaln > standard
-        if use_chunked_decoder:
-            self.decoder = ChunkedLocalDecoder(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=d_model * 4,
-                dropout=dropout,
-                latent_dim=latent_dim,
-                num_layers=n_decoder_layers,
-                chunk_size=chunk_size,
-                max_seq_len=max_seq_len,
-            )
-        elif use_adaln:
-            self.decoder = AdaLNTransformerDecoder(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=d_model * 4,
-                dropout=dropout,
-                latent_dim=latent_dim,
-                num_layers=n_decoder_layers,
-            )
-        else:
-            decoder_layer = nn.TransformerDecoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=d_model * 4,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=False,
-            )
-            self.decoder = nn.TransformerDecoder(decoder_layer, n_decoder_layers)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, n_decoder_layers)
 
         self.output_projection = nn.Linear(d_model, vocab_size)
 
@@ -543,15 +128,9 @@ class MusicVAE(L.LightningModule):
         # Training step counter for beta scheduling
         self.training_step_count = 0
 
-        # Will be set during training
-        self._total_training_steps = None
-
     def _init_weights(self):
         """Initialize model weights."""
-        for name, module in self.named_modules():
-            # Skip adaLN modulation layers (already zero-initialized)
-            if "adaLN_modulation" in name:
-                continue
+        for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -560,32 +139,13 @@ class MusicVAE(L.LightningModule):
                 nn.init.normal_(module.weight, mean=0, std=0.02)
 
     def get_beta(self):
-        """Get current beta value for KL loss weighting."""
-        if self.cyclical_annealing and self._total_training_steps is not None:
-            # Cyclical annealing: repeat beta warmup n_cycles times
-            steps_per_cycle = self._total_training_steps // self.n_cycles
-            if steps_per_cycle == 0:
-                steps_per_cycle = 1
-            cycle_position = self.training_step_count % steps_per_cycle
-            progress = cycle_position / steps_per_cycle
-            return self.beta_start + (self.beta_end - self.beta_start) * progress
-        elif self.beta_warmup_steps == 0:
-            # Exp annealing
+        """Get current beta value for KL loss weighting with warmup."""
+        if self.beta_warmup_steps == 0:
+            # exp annealing
             return self.beta_end * (1 - self.beta_decay_rate**self.training_step_count)
-        else:
-            # Linear warmup
-            progress = min(1.0, self.training_step_count / self.beta_warmup_steps)
-            return self.beta_start + (self.beta_end - self.beta_start) * progress
 
-    def get_sampling_probability(self):
-        """Get probability of using ground truth (inverse sigmoid schedule)."""
-        if not self.scheduled_sampling or self.scheduled_sampling_rate == 0:
-            return 1.0
-
-        k = self.scheduled_sampling_rate
-        i = self.training_step_count
-        epsilon = k / (k + math.exp(i / k))
-        return epsilon
+        progress = min(1.0, self.training_step_count / self.beta_warmup_steps)
+        return self.beta_start + (self.beta_end - self.beta_start) * progress
 
     def create_padding_mask(self, sequences):
         """Create padding mask for sequences."""
@@ -622,51 +182,37 @@ class MusicVAE(L.LightningModule):
 
         # Embed and add positional encoding
         embedded = self.token_embedding(sequences).transpose(0, 1)
-        assert not torch.isnan(embedded).any(), "NaN after embedding"
-
         embedded = self.pos_encoding(embedded)
-        assert not torch.isnan(embedded).any(), "NaN after pos encoding"
 
+        # Encode
         encoded = self.encoder(embedded, src_key_padding_mask=padding_mask)
-        assert not torch.isnan(encoded).any(), "NaN after encoder"
 
         # Pool to fixed-size representation
         if lengths is not None:
+            # Use actual sequence lengths for better pooling
             pooled = []
             for i, length in enumerate(lengths):
                 seq_repr = encoded[:length, i].mean(dim=0)
                 pooled.append(seq_repr)
             pooled = torch.stack(pooled)
         else:
+            # Use masking for pooling
             mask = padding_mask.transpose(0, 1).unsqueeze(-1)
             masked_encoded = encoded.masked_fill(mask, 0)
             valid_lengths = (
                 (~padding_mask).sum(dim=1, keepdim=True).float().transpose(0, 1)
             )
-            pooled = masked_encoded.sum(dim=0) / valid_lengths.squeeze(0).clamp(min=1)
+            pooled = masked_encoded.sum(dim=0) / valid_lengths.squeeze(0)
 
         # Project to latent space
-        # print("pooled", pooled)
         latent_params = self.encoder_to_latent(pooled)
         mu, logvar = latent_params.chunk(2, dim=-1)
 
+        # Create distribution
         std = torch.exp(0.5 * logvar)
         dist = Normal(mu, std)
 
         return dist, encoded
-
-    def create_memory(self, z):
-        """Create multi-token memory from latent vector.
-
-        Expands z into num_memory_tokens separate memory vectors for richer
-        cross-attention conditioning.
-        """
-        batch_size = z.shape[0]
-        # Project to multiple memory tokens
-        memory = self.latent_to_memory(z)  # (batch, num_tokens * d_model)
-        memory = memory.view(batch_size, self.num_memory_tokens, self.d_model)
-        memory = memory.transpose(0, 1)  # (num_tokens, batch, d_model)
-        return memory
 
     def decode_teacher_forcing(self, z, target_sequences):
         """Decode with teacher forcing for training."""
@@ -686,134 +232,21 @@ class MusicVAE(L.LightningModule):
 
         # Create masks
         padding_mask = self.create_padding_mask(decoder_input)
+        causal_mask = self.create_causal_mask(seq_len)
 
         # Embed decoder input
         embedded = self.token_embedding(decoder_input).transpose(0, 1)
         embedded = self.pos_encoding(embedded)
-        assert not torch.isnan(embedded).any(), "embedded nan"
 
-        # Decode based on architecture
-        if self.use_chunked_decoder:
-            # Chunked decoder handles its own masking and latent conditioning
-            decoded = self.decoder(embedded, z, tgt_key_padding_mask=padding_mask)
-            assert not torch.isnan(decoded).any(), "decoded nan"
-        elif self.use_adaln:
-            # adaLN decoder needs memory, z, and causal mask
-            memory = self.create_memory(z)
-            causal_mask = self.create_causal_mask(seq_len)
-            decoded = self.decoder(
-                embedded,
-                memory,
-                z,
-                tgt_mask=causal_mask,
-                tgt_key_padding_mask=padding_mask,
-            )
-        else:
-            # Standard decoder
-            memory = self.create_memory(z)
-            causal_mask = self.create_causal_mask(seq_len)
-            decoded = self.decoder(
-                embedded,
-                memory,
-                tgt_mask=causal_mask,
-                tgt_key_padding_mask=padding_mask,
-            )
+        # Create memory from latent vector
+        memory = self.latent_to_decoder(z).unsqueeze(0)
+
+        # Decode
+        decoded = self.decoder(
+            embedded, memory, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask
+        )
 
         # Project to vocabulary
-        logits = self.output_projection(decoded).transpose(0, 1)
-
-        return logits
-
-    def decode_scheduled_sampling(self, z, target_sequences):
-        """Decode with scheduled sampling - gradually mix ground truth with predictions."""
-        assert False
-        batch_size, seq_len = target_sequences.shape
-
-        sampling_prob = self.get_sampling_probability()
-
-        use_ground_truth = (
-            torch.rand(batch_size, seq_len, device=self.device) < sampling_prob
-        )
-
-        decoder_input_tokens = torch.full(
-            (batch_size, seq_len), self.pad_id, device=self.device
-        )
-        decoder_input_tokens[:, 0] = target_sequences[:, 0]
-
-        # For non-chunked decoders, create memory once
-        if not self.use_chunked_decoder:
-            memory = self.create_memory(z)
-
-        for t in range(1, seq_len):
-            current_input = torch.cat(
-                [
-                    torch.full((batch_size, 1), self.bos_id, device=self.device),
-                    decoder_input_tokens[:, :t],
-                ],
-                dim=1,
-            )
-
-            embedded = self.token_embedding(current_input).transpose(0, 1)
-            embedded = self.pos_encoding(embedded)
-
-            curr_len = current_input.shape[1]
-
-            with torch.no_grad():
-                if self.use_chunked_decoder:
-                    decoded = self.decoder(embedded, z)
-                elif self.use_adaln:
-                    causal_mask = self.create_causal_mask(curr_len)
-                    decoded = self.decoder(embedded, memory, z, tgt_mask=causal_mask)
-                else:
-                    causal_mask = self.create_causal_mask(curr_len)
-                    decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
-
-                logits_t = self.output_projection(decoded[-1])
-                probs = F.softmax(logits_t, dim=-1)
-                predicted_token = torch.multinomial(probs, 1).squeeze(-1)
-
-            ground_truth_token = target_sequences[:, t]
-            next_token = torch.where(
-                use_ground_truth[:, t], ground_truth_token, predicted_token
-            )
-            decoder_input_tokens[:, t] = next_token
-
-        # Final forward pass
-        decoder_input = torch.cat(
-            [
-                torch.full((batch_size, 1), self.bos_id, device=self.device),
-                decoder_input_tokens[:, :-1],
-            ],
-            dim=1,
-        )
-
-        decoder_input = self.apply_input_dropout(decoder_input)
-
-        padding_mask = self.create_padding_mask(decoder_input)
-
-        embedded = self.token_embedding(decoder_input).transpose(0, 1)
-        embedded = self.pos_encoding(embedded)
-
-        if self.use_chunked_decoder:
-            decoded = self.decoder(embedded, z, tgt_key_padding_mask=padding_mask)
-        elif self.use_adaln:
-            causal_mask = self.create_causal_mask(seq_len)
-            decoded = self.decoder(
-                embedded,
-                memory,
-                z,
-                tgt_mask=causal_mask,
-                tgt_key_padding_mask=padding_mask,
-            )
-        else:
-            causal_mask = self.create_causal_mask(seq_len)
-            decoded = self.decoder(
-                embedded,
-                memory,
-                tgt_mask=causal_mask,
-                tgt_key_padding_mask=padding_mask,
-            )
-
         logits = self.output_projection(decoded).transpose(0, 1)
 
         return logits
@@ -825,37 +258,39 @@ class MusicVAE(L.LightningModule):
 
         batch_size = z.shape[0]
 
+        # Initialize with BOS tokens
         generated = torch.full((batch_size, 1), self.bos_id, device=self.device)
 
-        # For non-chunked decoders, create memory once
-        if not self.use_chunked_decoder:
-            memory = self.create_memory(z)
+        # Create memory from latent vector
+        memory = self.latent_to_decoder(z).unsqueeze(0)
 
         for step in range(max_length):
+            # Create masks for current sequence
             seq_len = generated.shape[1]
+            causal_mask = self.create_causal_mask(seq_len)
 
+            # Embed current sequence
             embedded = self.token_embedding(generated).transpose(0, 1)
             embedded = self.pos_encoding(embedded)
 
-            if self.use_chunked_decoder:
-                decoded = self.decoder(embedded, z)
-            elif self.use_adaln:
-                causal_mask = self.create_causal_mask(seq_len)
-                decoded = self.decoder(embedded, memory, z, tgt_mask=causal_mask)
-            else:
-                causal_mask = self.create_causal_mask(seq_len)
-                decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
+            # Decode
+            decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
 
+            # Get logits for next token and apply temperature
             next_token_logits = self.output_projection(decoded[-1]) / temperature
 
             if temperature > 0:
+                # Sample next tokens
                 probs = F.softmax(next_token_logits, dim=-1)
                 next_tokens = torch.multinomial(probs, 1)
             else:
+                # Greedy decoding
                 next_tokens = next_token_logits.argmax(dim=-1, keepdim=True)
 
+            # Append to generated sequence
             generated = torch.cat([generated, next_tokens], dim=1)
 
+            # Check if all sequences have generated EOS
             if (next_tokens.squeeze(-1) == self.eos_id).all():
                 break
 
@@ -865,7 +300,10 @@ class MusicVAE(L.LightningModule):
         """Generate sequences from random latent vectors."""
         self.eval()
         with torch.no_grad():
+            # Sample random latent vectors
             z = torch.randn(batch_size, self.latent_dim, device=self.device)
+
+            # Generate sequences
             generated = self.decode_autoregressive(z, max_length, temperature)
         return generated
 
@@ -873,53 +311,46 @@ class MusicVAE(L.LightningModule):
         """Interpolate between two sequences in latent space."""
         self.eval()
         with torch.no_grad():
+            # Encode both sequences
             z1 = self.encode(seq1)[0].mean
             z2 = self.encode(seq2)[0].mean
 
+            # Interpolate in latent space
+            # TODO: is this right? it sucks
             if do_spherical:
-                # Spherical interpolation (slerp)
-                z1_norm = F.normalize(z1, dim=-1)
-                z2_norm = F.normalize(z2, dim=-1)
-                omega = torch.acos(
-                    (z1_norm * z2_norm).sum(dim=-1, keepdim=True).clamp(-1, 1)
-                )
-
-                alphas = torch.linspace(0, 1, num_steps, device=self.device)
+                alphas = torch.linspace(0, math.pi / 2, num_steps, device=self.device)
                 interpolated = []
                 for alpha in alphas:
-                    if omega.abs() < 1e-6:
-                        z_interp = (1 - alpha) * z1 + alpha * z2
-                    else:
-                        z_interp = (
-                            torch.sin((1 - alpha) * omega) * z1
-                            + torch.sin(alpha * omega) * z2
-                        ) / torch.sin(omega)
-                    generated = self.decode_autoregressive(z_interp)
+                    z_interp = (
+                        torch.cos(alpha) * z1 + torch.sin(alpha) * z2
+                    ) / math.sqrt(2)
+                    generated = self.decode_autoregressive(z_interp)  # .unsqueeze(0))
                     interpolated.append(generated)
             else:
                 alphas = torch.linspace(0, 1, num_steps, device=self.device)
-                interpolated = []
-                for alpha in alphas:
-                    z_interp = (1 - alpha) * z1 + alpha * z2
-                    generated = self.decode_autoregressive(z_interp)
-                    interpolated.append(generated)
+            interpolated = []
+
+            for alpha in alphas:
+                z_interp = (1 - alpha) * z1 + alpha * z2
+                generated = self.decode_autoregressive(z_interp)  # .unsqueeze(0))
+                interpolated.append(generated)
 
         return interpolated
 
     def forward(self, sequences, target_sequences=None, lengths=None, sample=True):
         """Full forward pass."""
+        # Encode
         latent_dist, encoded = self.encode(sequences, lengths)
 
+        # Sample or use mean
         if sample:
             z = latent_dist.rsample()
         else:
             z = latent_dist.mean
 
+        # Decode
         if target_sequences is not None:
-            if self.scheduled_sampling and self.training:
-                logits = self.decode_scheduled_sampling(z, target_sequences)
-            else:
-                logits = self.decode_teacher_forcing(z, target_sequences)
+            logits = self.decode_teacher_forcing(z, target_sequences)
             return {
                 "logits": logits,
                 "latent_dist": latent_dist,
@@ -927,6 +358,7 @@ class MusicVAE(L.LightningModule):
                 "encoded": encoded,
             }
         else:
+            # Inference mode
             generated = self.decode_autoregressive(z)
             return {
                 "generated": generated,
@@ -940,7 +372,7 @@ class MusicVAE(L.LightningModule):
         if beta is None:
             beta = self.get_beta()
 
-        # Reconstruction loss
+        # Reconstruction loss (cross entropy)
         reconstruction_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             targets.reshape(-1),
@@ -952,18 +384,16 @@ class MusicVAE(L.LightningModule):
         prior = Normal(
             torch.zeros_like(latent_dist.mean), torch.ones_like(latent_dist.stddev)
         )
-        kl_per_dim = torch.distributions.kl_divergence(latent_dist, prior)
-
+        kl_per_dim = torch.distributions.kl_divergence(latent_dist, prior).mean()
         if self.free_bits is not None:
-            # Free bits per dimension
-            free_bits_per_dim = self.free_bits / self.latent_dim
-            # Clamp KL per dimension, then sum
-            kl_loss = (
-                torch.clamp(kl_per_dim - free_bits_per_dim, min=0).sum(dim=-1).mean()
-            )
+            free_bits = self.free_bits / self.latent_dim
+            kl_loss = torch.max(
+                kl_per_dim - free_bits, torch.zeros_like(kl_per_dim)
+            ).mean()
         else:
-            kl_loss = kl_per_dim.sum(dim=-1).mean()
+            kl_loss = kl_per_dim
 
+        # Total loss
         total_loss = reconstruction_loss + beta * kl_loss
 
         return total_loss, reconstruction_loss, kl_loss
@@ -974,22 +404,22 @@ class MusicVAE(L.LightningModule):
         target_sequences = batch.get("target_sequences", sequences)
         lengths = batch.get("lengths", None)
 
+        # Forward pass
         outputs = self.forward(sequences, target_sequences, lengths, sample=True)
 
+        # Compute loss
         total_loss, recon_loss, kl_loss = self.compute_loss(
             outputs["logits"], target_sequences, outputs["latent_dist"]
         )
 
+        # Log metrics
         beta = self.get_beta()
         self.log("train/total_loss", total_loss, on_step=True, on_epoch=True)
         self.log("train/reconstruction_loss", recon_loss, on_step=True, on_epoch=True)
         self.log("train/kl_loss", kl_loss, on_step=True, on_epoch=True)
         self.log("trainer/beta", beta, on_step=True)
-        if self.scheduled_sampling:
-            self.log(
-                "trainer/sampling_prob", self.get_sampling_probability(), on_step=True
-            )
 
+        # Update training step counter
         self.training_step_count += 1
 
         return total_loss
@@ -1000,12 +430,15 @@ class MusicVAE(L.LightningModule):
         target_sequences = batch.get("target_sequences", sequences)
         lengths = batch.get("lengths", None)
 
+        # Forward pass without sampling for more stable validation
         outputs = self.forward(sequences, target_sequences, lengths, sample=False)
 
+        # Compute loss
         total_loss, recon_loss, kl_loss = self.compute_loss(
             outputs["logits"], target_sequences, outputs["latent_dist"]
         )
 
+        # Log validation metrics
         self.log("val/total_loss", total_loss, on_epoch=True, sync_dist=True)
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
         self.log("val/kl_loss", kl_loss, on_epoch=True, sync_dist=True)
@@ -1029,19 +462,22 @@ class MusicVAE(L.LightningModule):
             sync_dist=True,
         )
 
-        # Per-position cross entropy
-        logits = outputs["logits"]
+        # Compute per-position cross entropy
+        logits = outputs["logits"]  # (batch, seq_len, vocab)
         per_token_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             target_sequences.reshape(-1),
             ignore_index=self.pad_id,
             reduction="none",
-        ).reshape(target_sequences.shape)
+        ).reshape(target_sequences.shape)  # (batch, seq_len)
 
+        # Average across batch for each position
+        # Mask out padding positions
         mask = target_sequences != self.pad_id
         masked_loss = per_token_loss * mask
         position_loss = masked_loss.sum(dim=0) / mask.sum(dim=0).clamp(min=1)
 
+        # Log losses at key positions
         seq_len = position_loss.shape[0]
         if seq_len > 50:
             self.log(
@@ -1059,7 +495,12 @@ class MusicVAE(L.LightningModule):
             self.log(
                 "val/loss_pos_200", position_loss[199], on_epoch=True, sync_dist=True
             )
+        if seq_len > 250:
+            self.log(
+                "val/loss_pos_250", position_loss[199], on_epoch=True, sync_dist=True
+            )
 
+        # Store latent means for similarity analysis
         if len(self._val_latent_means) < 100:
             self._val_latent_means.append(outputs["latent_dist"].mean.detach().clone())
             self._val_latent_vars.append(
@@ -1074,26 +515,20 @@ class MusicVAE(L.LightningModule):
         target_sequences = batch.get("target_sequences", sequences)
         lengths = batch.get("lengths", None)
 
+        # Forward pass
         outputs = self.forward(sequences, target_sequences, lengths, sample=False)
 
+        # Compute loss
         total_loss, recon_loss, kl_loss = self.compute_loss(
             outputs["logits"], target_sequences, outputs["latent_dist"]
         )
 
+        # Log test metrics
         self.log("test/total_loss", total_loss)
         self.log("test/reconstruction_loss", recon_loss)
         self.log("test/kl_loss", kl_loss)
 
         return total_loss
-
-    def on_train_start(self):
-        """Called at the start of training to compute total steps for cyclical annealing."""
-        if self.trainer.max_steps and self.trainer.max_steps > 0:
-            self._total_training_steps = self.trainer.max_steps
-        else:
-            # Estimate from epochs
-            steps_per_epoch = len(self.trainer.train_dataloader)
-            self._total_training_steps = steps_per_epoch * self.trainer.max_epochs
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
@@ -1102,43 +537,13 @@ class MusicVAE(L.LightningModule):
         )
 
         if self.lr_schedule == "cosine":
-            # Use max_steps if available, otherwise estimate
-            if self.trainer.max_steps and self.trainer.max_steps > 0:
-                total_steps = self.trainer.max_steps
-            else:
-                # Estimate - this will be approximate
-                total_steps = self.trainer.max_epochs * 72162  # fallback estimate
-
+            # TODO: dumb hack
+            est_num_steps = self.trainer.max_epochs * 72162
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=total_steps,
+                T_max=est_num_steps,
                 eta_min=self.learning_rate * 0.01,
             )
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",  # This was the bug - needs to be step for step-level decay
-                    "frequency": 1,
-                },
-            }
-        elif self.lr_schedule == "warmup_cosine":
-            # Get total steps
-            if self.trainer.max_steps and self.trainer.max_steps > 0:
-                total_steps = self.trainer.max_steps
-            else:
-                total_steps = self.trainer.max_epochs * 72162
-
-            def lr_lambda(step):
-                if step < self.warmup_steps:
-                    return step / max(1, self.warmup_steps)
-                else:
-                    progress = (step - self.warmup_steps) / max(
-                        1, total_steps - self.warmup_steps
-                    )
-                    return 0.5 * (1 + math.cos(math.pi * progress))
-
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
@@ -1155,19 +560,24 @@ class MusicVAE(L.LightningModule):
         if not hasattr(self, "_val_latent_means") or len(self._val_latent_means) == 0:
             return
 
+        # Concatenate all latent means from validation batches
         all_means = torch.cat(self._val_latent_means, dim=0)
 
+        # Compute pairwise cosine similarities
         normalized = F.normalize(all_means, dim=1)
         similarity_matrix = torch.mm(normalized, normalized.t())
 
+        # Extract upper triangular (excluding diagonal)
         mask = torch.triu(torch.ones_like(similarity_matrix), diagonal=1).bool()
         similarities = similarity_matrix[mask]
 
+        # Compute statistics
         self.log("val_sim/mean", similarities.mean(), sync_dist=True)
         self.log("val_sim/std", similarities.std(), sync_dist=True)
         self.log("val_sim/min", similarities.min(), sync_dist=True)
         self.log("val_sim/max", similarities.max(), sync_dist=True)
 
+        # Compute threshold percentages
         total_pairs = len(similarities)
         pct_above_90 = (similarities > 0.9).sum().float() / total_pairs * 100
         pct_above_75 = (similarities > 0.75).sum().float() / total_pairs * 100
@@ -1187,12 +597,14 @@ class MusicVAE(L.LightningModule):
             sync_dist=True,
         )
 
+        # Clear stored latent means for next epoch
         self._val_latent_means = []
         self._val_latent_vars = []
 
     @classmethod
     def load_id(cls, run_id: int, checkpoints_dir: str = "checkpoints"):
         """Load checkpoint by run ID number."""
+        # Find folder starting with the run_id
         checkpoint_path = Path(checkpoints_dir)
         matching = list(checkpoint_path.glob(f"{run_id}_*"))
 

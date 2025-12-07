@@ -1,17 +1,13 @@
-inherit: default_256
-name: "44_d128_b50_baseline"
+inherit: default_1024
+name: "45_d128_b50_baseline_smaller"
 
 data:
   ds_path: "/home/christian/vae/data_nb_1b_combined_capped_50k"
   sampler_power: 1.0
 
 model:
-  latent_dim: 128
   beta_end: 0.2
-  free_bits: 6
-  dropout: 0.2
+  free_bits: 48
 
 trainer:
-  max_epochs: 2
-
-mm: "old"
+  max_epochs: 5
