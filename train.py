@@ -103,7 +103,7 @@ def main(config_files: list[str]):
         try:
             run_single_training(config_path)
         except Exception as e:
-            # raise e
+            raise e
             print(f"ERROR in {config_path}: {e}")
             print("Continuing to next run...")
             continue

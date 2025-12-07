@@ -212,6 +212,7 @@ class ChunkedLocalDecoderLayer(nn.Module):
         """
         # Self attention (chunk-local only due to mask)
         tgt_norm = self.norm1(tgt)
+        assert not torch.isnan(tgt_norm).any(), "tgt_norm nan"
         self_attn_out, _ = self.self_attn(
             tgt_norm,
             tgt_norm,
@@ -219,37 +220,43 @@ class ChunkedLocalDecoderLayer(nn.Module):
             attn_mask=chunk_mask,
             key_padding_mask=tgt_key_padding_mask,
         )
+
+        # Replace NaNs from fully-masked rows (padding positions)
+        self_attn_out = torch.nan_to_num(self_attn_out, nan=0.0)
+        assert not torch.isnan(self_attn_out).any(), "sao nan"
+
         tgt = tgt + self.dropout(self_attn_out)
+        assert not torch.isnan(tgt).any(), "tgt1 nan"
 
         # Cross attention to conductor embeddings
         # Each position attends to its corresponding conductor embedding
         tgt_norm = self.norm2(tgt)
+        assert not torch.isnan(tgt_norm).any(), "tgt_norm2 nan"
+
         cross_attn_out, _ = self.cross_attn(
             tgt_norm, conductor_embeds, conductor_embeds
         )
+        assert not torch.isnan(self_attn_out).any(), "xao nan"
         tgt = tgt + self.dropout(cross_attn_out)
+        assert not torch.isnan(tgt).any(), "tgt2 nan"
 
         # FFN
         tgt_norm = self.norm3(tgt)
+        assert not torch.isnan(tgt_norm).any(), "tgt_norm3 nan"
         ffn_out = self.ffn(tgt_norm)
+        assert not torch.isnan(ffn_out).any(), "ffn nan"
         tgt = tgt + ffn_out
+        assert not torch.isnan(tgt).any(), "tgt3 nan"
 
         return tgt
 
 
 class ChunkedLocalDecoder(nn.Module):
-    """Hierarchical decoder with chunk-local self-attention.
+    """Hierarchical decoder with fixed-size chunk processing.
 
-    Implements the key insight from MusicVAE: break the information pathway
-    so that global context MUST flow through the latent -> conductor -> decoder path.
-
-    For a sequence of length T split into num_chunks chunks:
-    1. Conductor maps z -> num_chunks embeddings (one per chunk)
-    2. Each token can only self-attend within its chunk (block-diagonal mask)
-    3. Each token cross-attends to its chunk's conductor embedding
-
-    This forces the model to encode global structure in z, since the decoder
-    cannot directly "see" tokens outside its local chunk.
+    Each chunk of 16 tokens is processed independently with full causal attention.
+    Chunks that are entirely padding are skipped.
+    Global info flows through z -> conductor -> per-chunk embeddings.
     """
 
     def __init__(
@@ -266,16 +273,13 @@ class ChunkedLocalDecoder(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.chunk_size = chunk_size
-        self.max_seq_len = max_seq_len
         self.max_chunks = (max_seq_len + chunk_size - 1) // chunk_size
 
-        # Conductor: z -> sequence of chunk embeddings
-        # Using a small transformer to generate chunk embeddings autoregressively
-        # (non-autoregressive also works but this is closer to MusicVAE's conductor RNN)
-        self.conductor_embed = nn.Parameter(
-            torch.randn(self.max_chunks, d_model) * 0.02
+        # Conductor: z -> per-chunk embeddings
+        self.conductor_embed = nn.Parameter(torch.zeros(self.max_chunks, d_model))
+        self.conductor_proj = nn.Sequential(
+            nn.Linear(latent_dim, d_model), nn.LayerNorm(d_model)
         )
-        self.conductor_proj = nn.Linear(latent_dim, d_model)
         self.conductor_layers = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=d_model,
@@ -285,111 +289,119 @@ class ChunkedLocalDecoder(nn.Module):
                 activation="gelu",
                 batch_first=False,
             ),
-            num_layers=2,  # Lightweight conductor
+            num_layers=2,
         )
-        self.conductor_out = nn.Linear(d_model, d_model)
-
-        # Main decoder layers with chunk-local attention
-        self.layers = nn.ModuleList(
-            [
-                ChunkedLocalDecoderLayer(d_model, nhead, dim_feedforward, dropout)
-                for _ in range(num_layers)
-            ]
+        self.conductor_out = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.LayerNorm(d_model)
         )
 
-        # Cache for chunk masks
-        self._chunk_mask_cache = {}
-
-    def create_chunk_causal_mask(self, seq_len, device):
-        """Create block-diagonal causal mask for chunk-local attention.
-
-        Tokens can only attend to:
-        1. Tokens within the same chunk
-        2. Tokens that come before them (causal)
-
-        Returns mask where True = blocked, False = allowed (PyTorch convention)
-        """
-        cache_key = (seq_len, device)
-        if cache_key in self._chunk_mask_cache:
-            return self._chunk_mask_cache[cache_key]
-
-        # Start with all blocked
-        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
-
-        # Unblock within-chunk attention
-        for chunk_start in range(0, seq_len, self.chunk_size):
-            chunk_end = min(chunk_start + self.chunk_size, seq_len)
-            mask[chunk_start:chunk_end, chunk_start:chunk_end] = False
-
-        # Apply causal masking (block future tokens)
-        causal = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1
+        # Chunk-local decoder layers (standard transformer decoder)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,
         )
-        mask = mask | causal
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
 
-        self._chunk_mask_cache[cache_key] = mask
-        return mask
+        # Cache causal mask for chunk_size
+        self.register_buffer(
+            "_causal_mask",
+            torch.triu(torch.ones(chunk_size, chunk_size), diagonal=1).bool(),
+        )
 
-    def get_conductor_embeddings(self, z, seq_len):
-        """Generate per-chunk conductor embeddings from latent z.
-
-        z: (batch, latent_dim)
-        Returns: (seq_len, batch, d_model) - embeddings broadcast to each position
-        """
+    def get_conductor_embeddings(self, z, num_chunks):
+        """Generate per-chunk conductor embeddings from latent z."""
         batch_size = z.shape[0]
-        device = z.device
 
-        num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
-
-        # Project z and add to learnable chunk position embeddings
         z_proj = self.conductor_proj(z)  # (batch, d_model)
         chunk_embeds = self.conductor_embed[:num_chunks].unsqueeze(
             1
         )  # (num_chunks, 1, d_model)
         chunk_embeds = chunk_embeds.expand(
             -1, batch_size, -1
-        )  # (num_chunks, batch, d_model)
-        chunk_embeds = chunk_embeds + z_proj.unsqueeze(0)  # Add z to each chunk embed
+        ).clone()  # (num_chunks, batch, d_model)
+        chunk_embeds = chunk_embeds + z_proj.unsqueeze(0)
+        chunk_embeds = F.layer_norm(chunk_embeds, [self.d_model])
 
-        # Pass through conductor transformer
-        chunk_embeds = self.conductor_layers(
-            chunk_embeds
-        )  # (num_chunks, batch, d_model)
-        chunk_embeds = self.conductor_out(chunk_embeds)  # (num_chunks, batch, d_model)
+        chunk_embeds = self.conductor_layers(chunk_embeds)
+        chunk_embeds = self.conductor_out(chunk_embeds)
 
-        # Expand to per-position: each position gets its chunk's embedding
-        position_embeds = []
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * self.chunk_size
-            chunk_end = min(chunk_start + self.chunk_size, seq_len)
-            chunk_len = chunk_end - chunk_start
-            # Repeat this chunk's embedding for all positions in the chunk
-            expanded = chunk_embeds[chunk_idx : chunk_idx + 1].expand(chunk_len, -1, -1)
-            position_embeds.append(expanded)
-
-        position_embeds = torch.cat(position_embeds, dim=0)  # (seq_len, batch, d_model)
-        return position_embeds
+        return chunk_embeds  # (num_chunks, batch, d_model)
 
     def forward(self, tgt, z, tgt_key_padding_mask=None):
         """
         tgt: (seq_len, batch, d_model)
         z: (batch, latent_dim)
+        tgt_key_padding_mask: (batch, seq_len) - True means padding
         """
-        seq_len = tgt.shape[0]
+        seq_len, batch_size, _ = tgt.shape
         device = tgt.device
 
-        # Get chunk-local causal mask
-        chunk_mask = self.create_chunk_causal_mask(seq_len, device)
+        num_chunks = (seq_len + self.chunk_size - 1) // self.chunk_size
 
-        # Get per-position conductor embeddings
-        conductor_embeds = self.get_conductor_embeddings(z, seq_len)
+        # Get conductor embeddings for each chunk
+        conductor_embeds = self.get_conductor_embeddings(
+            z, num_chunks
+        )  # (num_chunks, batch, d_model)
 
-        # Add conductor embeddings directly to input (also available via cross-attention)
-        output = tgt + conductor_embeds
+        # Process each chunk independently
+        output_chunks = []
 
-        # Pass through decoder layers
-        for layer in self.layers:
-            output = layer(output, conductor_embeds, chunk_mask, tgt_key_padding_mask)
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * self.chunk_size
+            end = min(start + self.chunk_size, seq_len)
+            chunk_len = end - start
+
+            # Extract chunk
+            chunk_tgt = tgt[start:end]  # (chunk_len, batch, d_model)
+
+            # Check which batch elements have this chunk entirely padded
+            if tgt_key_padding_mask is not None:
+                chunk_padding = tgt_key_padding_mask[:, start:end]  # (batch, chunk_len)
+                entirely_padded = chunk_padding.all(dim=1)  # (batch,)
+            else:
+                entirely_padded = torch.zeros(
+                    batch_size, dtype=torch.bool, device=device
+                )
+
+            # Get conductor embedding for this chunk as memory
+            chunk_memory = conductor_embeds[
+                chunk_idx : chunk_idx + 1
+            ]  # (1, batch, d_model)
+
+            # Create causal mask for this chunk
+            if chunk_len == self.chunk_size:
+                causal_mask = self._causal_mask
+            else:
+                causal_mask = torch.triu(
+                    torch.ones(chunk_len, chunk_len, device=device), diagonal=1
+                ).bool()
+
+            # Decode chunk
+            if entirely_padded.all():
+                # Skip entirely - just pass through zeros
+                chunk_out = torch.zeros_like(chunk_tgt)
+            else:
+                chunk_padding_mask = (
+                    chunk_padding if tgt_key_padding_mask is not None else None
+                )
+                chunk_out = self.decoder(
+                    chunk_tgt,
+                    chunk_memory,
+                    tgt_mask=causal_mask,
+                    tgt_key_padding_mask=chunk_padding_mask,
+                )
+                # Zero out entirely padded batch elements
+                if entirely_padded.any():
+                    chunk_out[:, entirely_padded] = 0
+
+            output_chunks.append(chunk_out)
+
+        # Concatenate chunks back together
+        output = torch.cat(output_chunks, dim=0)  # (seq_len, batch, d_model)
 
         return output
 
@@ -610,10 +622,13 @@ class MusicVAE(L.LightningModule):
 
         # Embed and add positional encoding
         embedded = self.token_embedding(sequences).transpose(0, 1)
-        embedded = self.pos_encoding(embedded)
+        assert not torch.isnan(embedded).any(), "NaN after embedding"
 
-        # Encode
+        embedded = self.pos_encoding(embedded)
+        assert not torch.isnan(embedded).any(), "NaN after pos encoding"
+
         encoded = self.encoder(embedded, src_key_padding_mask=padding_mask)
+        assert not torch.isnan(encoded).any(), "NaN after encoder"
 
         # Pool to fixed-size representation
         if lengths is not None:
@@ -628,9 +643,10 @@ class MusicVAE(L.LightningModule):
             valid_lengths = (
                 (~padding_mask).sum(dim=1, keepdim=True).float().transpose(0, 1)
             )
-            pooled = masked_encoded.sum(dim=0) / valid_lengths.squeeze(0)
+            pooled = masked_encoded.sum(dim=0) / valid_lengths.squeeze(0).clamp(min=1)
 
         # Project to latent space
+        # print("pooled", pooled)
         latent_params = self.encoder_to_latent(pooled)
         mu, logvar = latent_params.chunk(2, dim=-1)
 
@@ -674,11 +690,13 @@ class MusicVAE(L.LightningModule):
         # Embed decoder input
         embedded = self.token_embedding(decoder_input).transpose(0, 1)
         embedded = self.pos_encoding(embedded)
+        assert not torch.isnan(embedded).any(), "embedded nan"
 
         # Decode based on architecture
         if self.use_chunked_decoder:
             # Chunked decoder handles its own masking and latent conditioning
             decoded = self.decoder(embedded, z, tgt_key_padding_mask=padding_mask)
+            assert not torch.isnan(decoded).any(), "decoded nan"
         elif self.use_adaln:
             # adaLN decoder needs memory, z, and causal mask
             memory = self.create_memory(z)
@@ -708,6 +726,7 @@ class MusicVAE(L.LightningModule):
 
     def decode_scheduled_sampling(self, z, target_sequences):
         """Decode with scheduled sampling - gradually mix ground truth with predictions."""
+        assert False
         batch_size, seq_len = target_sequences.shape
 
         sampling_prob = self.get_sampling_probability()
@@ -1088,7 +1107,7 @@ class MusicVAE(L.LightningModule):
                 total_steps = self.trainer.max_steps
             else:
                 # Estimate - this will be approximate
-                total_steps = self.trainer.max_epochs * 1000  # fallback estimate
+                total_steps = self.trainer.max_epochs * 72162  # fallback estimate
 
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
@@ -1108,7 +1127,7 @@ class MusicVAE(L.LightningModule):
             if self.trainer.max_steps and self.trainer.max_steps > 0:
                 total_steps = self.trainer.max_steps
             else:
-                total_steps = self.trainer.max_epochs * 1000
+                total_steps = self.trainer.max_epochs * 72162
 
             def lr_lambda(step):
                 if step < self.warmup_steps:
