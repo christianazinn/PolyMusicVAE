@@ -57,11 +57,6 @@ def run_single_training(config_path: str):
         shutil.move(str(last_ckpt), str(run_dir / "last.ckpt"))
         print(f"Moved last.ckpt to {run_dir}")
 
-    # Remove intermediate checkpoints (keep only last.ckpt in run folder)
-    # for ckpt in checkpoint_dir.glob("music-vae-epoch=*-val"):
-    #     ckpt.unlink()
-    #     print(f"Removed intermediate checkpoint: {ckpt.name}")
-
     print(f"\nCompleted training run: {run_name}\n")
     wandb.finish()
     del trainer_config["logger"]

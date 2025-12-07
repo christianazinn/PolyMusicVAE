@@ -114,12 +114,15 @@ def create_dataloaders(
     assert sampler_power > 0.0, "testing, this should be passed through"
 
     train_dataset = MusicDataset(train_hf)
+    ppath = f"data/train_sampler_power_{sampler_power}.pkl"
     try:
-        with open(f"data/train_sampler_power_{sampler_power}.pkl", "rb") as f:
+        print(f"attempting to load sampler from {ppath}")
+        with open(ppath, "rb") as f:
             train_sampler = pickle.load(f)
     except FileNotFoundError:
+        print("didn't find it, prepare to wait")
         train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
-        with open(f"data/train_sampler_power_{sampler_power}.pkl", "wb") as f:
+        with open(ppath, "wb") as f:
             pickle.dump(train_sampler, f)
     train_loader = DataLoader(
         train_dataset, sampler=train_sampler, drop_last=True, **dl_kwargs
