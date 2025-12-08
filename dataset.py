@@ -33,7 +33,7 @@ def collate_fn(batch: List[Dict], pad_token_id: int = 0):
 
     return {
         "sequences": padded_sequences,
-        "target_sequences": padded_sequences.clone(),  # teacher forcing
+        "target_sequences": padded_sequences.clone(),
         "lengths": torch.tensor(lengths, dtype=torch.long),
     }
 
@@ -78,12 +78,12 @@ def create_length_weighted_sampler(dataset, power=0.0, max_samples=2**24 - 1):
     lengths = [len(dataset.ds[i]["s"]) for i in range(len(dataset))][:max_samples]
     weights = [length**power for length in lengths]
 
-    # Use fewer samples than dataset size
     num_samples = min(len(dataset), max_samples)
 
     return WeightedRandomSampler(
         weights=weights,
         # TODO cannot be over 2**24 - 1 due to some PyTorch limitation
+        # which is apparently not documented anywhere (how delightful)
         num_samples=num_samples,
         replacement=True,
     )
@@ -120,7 +120,7 @@ def create_dataloaders(
         with open(ppath, "rb") as f:
             train_sampler = pickle.load(f)
     except FileNotFoundError:
-        print("didn't find it, prepare to wait")
+        print("didn't find it, prepare to wait (a lot)")
         train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
         with open(ppath, "wb") as f:
             pickle.dump(train_sampler, f)
