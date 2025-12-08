@@ -1,10 +1,11 @@
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
 from datasets import load_from_disk, Dataset as HFDataset
 from os import PathLike
 from typing import Dict, List, Optional, Tuple
 import json
+import pickle
 
 
 class MusicDataset(Dataset):
@@ -32,7 +33,7 @@ def collate_fn(batch: List[Dict], pad_token_id: int = 0):
 
     return {
         "sequences": padded_sequences,
-        "target_sequences": padded_sequences.clone(),  # teacher forcing
+        "target_sequences": padded_sequences.clone(),
         "lengths": torch.tensor(lengths, dtype=torch.long),
     }
 
@@ -73,6 +74,21 @@ def create_splits(
     )
 
 
+def create_length_weighted_sampler(dataset, power=0.0, max_samples=2**24 - 1):
+    lengths = [len(dataset.ds[i]["s"]) for i in range(len(dataset))][:max_samples]
+    weights = [length**power for length in lengths]
+
+    num_samples = min(len(dataset), max_samples)
+
+    return WeightedRandomSampler(
+        weights=weights,
+        # TODO cannot be over 2**24 - 1 due to some PyTorch limitation
+        # which is apparently not documented anywhere (how delightful)
+        num_samples=num_samples,
+        replacement=True,
+    )
+
+
 def create_dataloaders(
     ds_path: PathLike,
     batch_size: int = 32,
@@ -81,14 +97,11 @@ def create_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     pin_memory: bool = True,
+    sampler_power: float = 0.0,
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], Dict]:
     train_hf, val_hf, test_hf, config = create_splits(
         ds_path, val_split, test_split, seed
     )
-
-    train_dataset = MusicDataset(train_hf)
-    val_dataset = MusicDataset(val_hf) if val_hf else None
-    test_dataset = MusicDataset(test_hf) if test_hf else None
 
     collate_func = lambda batch: collate_fn(batch, config["pad_id"])
     dl_kwargs = {
@@ -98,14 +111,31 @@ def create_dataloaders(
         "collate_fn": collate_func,
     }
 
-    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **dl_kwargs)
+    assert sampler_power > 0.0, "testing, this should be passed through"
 
-    val_loader = (
-        DataLoader(val_dataset, shuffle=False, **dl_kwargs) if val_dataset else None
+    train_dataset = MusicDataset(train_hf)
+    ppath = f"data/train_sampler_power_{sampler_power}.pkl"
+    try:
+        print(f"attempting to load sampler from {ppath}")
+        with open(ppath, "rb") as f:
+            train_sampler = pickle.load(f)
+    except FileNotFoundError:
+        print("didn't find it, prepare to wait (a lot)")
+        train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
+        with open(ppath, "wb") as f:
+            pickle.dump(train_sampler, f)
+    train_loader = DataLoader(
+        train_dataset, sampler=train_sampler, drop_last=True, **dl_kwargs
     )
-
-    test_loader = (
-        DataLoader(test_dataset, shuffle=False, **dl_kwargs) if test_dataset else None
-    )
+    if val_hf:
+        val_dataset = MusicDataset(val_hf)
+        val_loader = DataLoader(val_dataset, shuffle=False, **dl_kwargs)
+    else:
+        val_loader = None
+    if test_hf:
+        test_dataset = MusicDataset(test_hf)
+        test_loader = DataLoader(test_dataset, shuffle=False, **dl_kwargs)
+    else:
+        test_loader = None
 
     return train_loader, val_loader, test_loader, config

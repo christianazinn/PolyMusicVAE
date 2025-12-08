@@ -1,0 +1,19 @@
+inherit: base
+name: "39_d64_wrsp1_higher_beta"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1b_combined"
+  sampler_power: 1.0
+
+model:
+  d_model: 256
+  n_heads: 4
+  n_encoder_layers: 6
+  n_decoder_layers: 6
+  latent_dim: 64
+  beta_end: 0.5
+  free_bits: 3
+  beta_warmup_steps: 40000
+
+trainer:
+  max_epochs: 1

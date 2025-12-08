@@ -41,16 +41,14 @@ def interpolate_base(
         modes=["frame", "onset"], pitch_range=[0, 128], encode_velocity=False
     )
 
-    # Create figure and plot piano roll data
+    # piano roll wheeeeee
     h, w = concat_pianoroll[0, 0].shape
     n_sections = len(scores)
 
-    # Create background with color gradient
     cmap = plt.cm.gnuplot
     adj = 100
     background = np.zeros((h, w, 3))
 
-    # Calculate section widths (assuming equal spacing at 32 ticks each)
     section_width = w // n_sections
     for i in range(n_sections):
         t = i / (n_sections - 1 + adj)
@@ -59,15 +57,12 @@ def interpolate_base(
         end = (i + 1) * section_width if i < n_sections - 1 else w
         background[:, start:end] = color
 
-    # Combine background with piano roll using different colors
     frame = concat_pianoroll[0, 0]  # sustained notes
     onset = concat_pianoroll[1, 0]  # note onsets
 
     final_img = background.copy()
-    # Green/cyan for sustained notes
     sustained_mask = (frame > 0) & (onset == 0)
     final_img[sustained_mask] = [1, 1, 1]
-    # Yellow for note onsets
     onset_mask = onset > 0
     final_img[onset_mask] = [0, 0.8, 0.6]
 
@@ -125,10 +120,9 @@ def test_interpolate_for(
 
 if __name__ == "__main__":
     ds, _, _, _ = create_splits(
-        ds_path="/home/christian/vae/data_nb_1/b", val_split=0.0, test_split=0.0
+        ds_path="/home/christian/vae/data_nb_1/a", val_split=0.0, test_split=0.0
     )
     tokenizer = REMI()
-    model = MusicVAE.load_id(25)
+    model = MusicVAE.load_id(33)
     model.eval()
-    # model = MusicVAE.load_from_checkpoint("checkpoints/last.ckpt")
     test_interpolate_for(model, tokenizer, ds, iiter=10, do_spherical=False)

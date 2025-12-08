@@ -1,6 +1,8 @@
 # custom
 wandb/
 checkpoints/
+.claude/
+*.pkl
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

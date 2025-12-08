@@ -5,62 +5,50 @@ from lightning.pytorch.loggers import WandbLogger
 from model import MusicVAE, get_callbacks
 from dataset import create_dataloaders
 from config_loader import load_config, print_config_types
+import lightning as L
 import wandb
 
 
 def run_single_training(config_path: str):
-    """Run a single training job from a config file."""
     wandb.finish()
-    # Load config
     config = load_config(config_path)
-    print("\n=== Config ===")
+    print("\n======= Config =======")
     print_config_types(config)
     print("===================\n")
 
     run_name = config["name"]
-    print(f"\n{'='*60}")
+    print(f"{'='*60}")
     print(f"Starting training run: {run_name}")
     print(f"{'='*60}\n")
 
-    # Create dataloaders
     train_loader, val_loader, _, config_data = create_dataloaders(**config["data"])
 
-    # Create model
     model_config = {**config["model"], **config_data}
     model = MusicVAE(**model_config)
 
-    # Setup trainer
     trainer_config = config["trainer"].copy()
     trainer_config["logger"] = WandbLogger(
         project="music-vae", name=run_name, log_model=True
     )
     trainer_config["callbacks"] = get_callbacks()
 
-    import lightning as L
-
     # hack to get it to work on the 8xA40 node
     # from lightning.pytorch.strategies import DDPStrategy
     # strategy = DDPStrategy(broadcast_buffers=False)
     # trainer_config["strategy"] = strategy
-    trainer = L.Trainer(**trainer_config)
+    trainer = L.Trainer(use_distributed_sampler=False, **trainer_config)
 
     trainer.fit(model, train_loader, val_loader)
 
-    # Post-training cleanup
     checkpoint_dir = Path("checkpoints")
     run_dir = checkpoint_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Move last.ckpt to run-specific folder
+    # move last.ckpt to run-specific folder
     last_ckpt = checkpoint_dir / "last.ckpt"
     if last_ckpt.exists():
         shutil.move(str(last_ckpt), str(run_dir / "last.ckpt"))
         print(f"Moved last.ckpt to {run_dir}")
-
-    # Remove intermediate checkpoints (keep only last.ckpt in run folder)
-    for ckpt in checkpoint_dir.glob("music-vae-epoch=*-val"):
-        ckpt.unlink()
-        print(f"Removed intermediate checkpoint: {ckpt.name}")
 
     print(f"\nCompleted training run: {run_name}\n")
     wandb.finish()
@@ -101,7 +89,6 @@ TODO: relatedly, you may need to reduce epoch length b/c you have 24M samples
 
 
 def main(config_files: list[str]):
-    """Run multiple training jobs in sequence."""
     print(f"Queued {len(config_files)} training runs")
 
     for i, config_path in enumerate(config_files, 1):
@@ -109,14 +96,10 @@ def main(config_files: list[str]):
         try:
             run_single_training(config_path)
         except Exception as e:
+            raise e
             print(f"ERROR in {config_path}: {e}")
             print("Continuing to next run...")
             continue
-
-    print("\n" + "=" * 60)
-    print("All training runs completed!")
-    print("=" * 60)
-
 
 if __name__ == "__main__":
     assert len(sys.argv) == 3, "Usage: python train.py <start> <end>"

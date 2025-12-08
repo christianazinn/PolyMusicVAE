@@ -1,0 +1,20 @@
+inherit: default_256
+name: "43_d64_b50_adaln"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1b_combined_capped_50k"
+  sampler_power: 1.0
+
+model:
+  latent_dim: 128
+  beta_end: 0.2
+  free_bits: 6
+  use_chunked_decoder: false
+  use_adaln: true
+  input_dropout: 0.1
+  cyclical_annealing: true
+  n_cycles: 4
+  dropout: 0.1
+
+trainer:
+  max_epochs: 2
