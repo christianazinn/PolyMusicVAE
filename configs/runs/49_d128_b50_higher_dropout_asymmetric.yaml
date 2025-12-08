@@ -1,5 +1,5 @@
 inherit: default_256
-name: "48_d128_b50_baseline_asymmetric"
+name: "49_d128_b50_higher_dropout_asymmetric"
 
 data:
   ds_path: "/home/christian/vae/data_nb_1b_combined_capped_50k"
@@ -10,6 +10,7 @@ model:
   beta_end: 0.2
   free_bits: 6
   beta_warmup_steps: 100000
+  input_dropout: 0.6
   dropout: 0.2
   n_encoder_layers: 4
   n_decoder_layers: 2

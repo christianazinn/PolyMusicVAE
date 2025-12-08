@@ -384,12 +384,44 @@ class MusicVAE(L.LightningModule):
         prior = Normal(
             torch.zeros_like(latent_dist.mean), torch.ones_like(latent_dist.stddev)
         )
+
+        kl_per_example = (
+            torch.distributions.kl_divergence(latent_dist, prior).sum(dim=-1).mean()
+        )
+        if hasattr(self, "log"):
+            self.log("debug/kl_total_per_example", kl_per_example.item(), on_step=True)
         kl_per_dim = torch.distributions.kl_divergence(latent_dist, prior).mean()
+        # if self.free_bits is not None:
+        #     free_bits = self.free_bits / self.latent_dim
+        #     kl_loss = torch.max(
+        #         kl_per_dim - free_bits, torch.zeros_like(kl_per_dim)
+        #     ).mean()
+        # else:
+        #     kl_loss = kl_per_dim
+        # DIAGNOSTIC CODE - START
+        kl_before_free_bits = kl_per_dim.item()
+        # DIAGNOSTIC CODE - END
+
         if self.free_bits is not None:
             free_bits = self.free_bits / self.latent_dim
             kl_loss = torch.max(
                 kl_per_dim - free_bits, torch.zeros_like(kl_per_dim)
             ).mean()
+
+            # DIAGNOSTIC CODE - START
+            kl_after_free_bits = kl_loss.item()
+            free_bits_threshold = free_bits
+            reduction_pct = 100 * (
+                1 - kl_after_free_bits / (kl_before_free_bits + 1e-8)
+            )
+
+            # Log these
+            if hasattr(self, "log"):
+                self.log("debug/kl_before_free_bits", kl_before_free_bits, on_step=True)
+                self.log("debug/kl_after_free_bits", kl_after_free_bits, on_step=True)
+                self.log("debug/free_bits_threshold", free_bits_threshold, on_step=True)
+                self.log("debug/kl_reduction_pct", reduction_pct, on_step=True)
+            # DIAGNOSTIC CODE - END
         else:
             kl_loss = kl_per_dim
 
@@ -442,6 +474,39 @@ class MusicVAE(L.LightningModule):
         self.log("val/total_loss", total_loss, on_epoch=True, sync_dist=True)
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
         self.log("val/kl_loss", kl_loss, on_epoch=True, sync_dist=True)
+
+        # DIAGNOSTIC: Compare reconstruction with real latent vs zero latent
+        z_zero = torch.zeros_like(outputs["z"])
+        logits_zero = self.decode_teacher_forcing(z_zero, target_sequences)
+        loss_zero = F.cross_entropy(
+            logits_zero.reshape(-1, self.vocab_size),
+            target_sequences.reshape(-1),
+            ignore_index=self.pad_id,
+            reduction="mean",
+        )
+
+        self.log("val/loss_with_latent", recon_loss, on_epoch=True, sync_dist=True)
+        self.log("val/loss_with_zero_latent", loss_zero, on_epoch=True, sync_dist=True)
+        self.log(
+            "val/latent_benefit_to_reconstruction",
+            loss_zero - recon_loss,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        # Decode with 10x stronger latent signal (hacky but diagnostic)
+        z_boosted = outputs["z"] * 10.0
+        logits_boosted = self.decode_teacher_forcing(z_boosted, target_sequences)
+        loss_boosted = F.cross_entropy(
+            logits_boosted.reshape(-1, self.vocab_size),
+            target_sequences.reshape(-1),
+            ignore_index=self.pad_id,
+            reduction="mean",
+        )
+
+        self.log(
+            "val/loss_with_boosted_latent", loss_boosted, on_epoch=True, sync_dist=True
+        )
 
         latent_mean = outputs["latent_dist"].mean
         latent_std = outputs["latent_dist"].stddev

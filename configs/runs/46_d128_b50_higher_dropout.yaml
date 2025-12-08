@@ -9,7 +9,8 @@ model:
   latent_dim: 128
   beta_end: 0.2
   free_bits: 6
-  input_dropout: 0.25
+  beta_warmup_steps: 100000
+  input_dropout: 0.6
   dropout: 0.2
 
 trainer:
