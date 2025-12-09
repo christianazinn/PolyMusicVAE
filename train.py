@@ -1,3 +1,4 @@
+import os
 import sys
 import shutil
 from pathlib import Path
@@ -102,13 +103,27 @@ def main(config_files: list[str]):
             continue
 
 if __name__ == "__main__":
-    assert len(sys.argv) == 3, "Usage: python train.py <start> <end>"
-    start = int(sys.argv[1])
-    end = int(sys.argv[2])
+    if len(sys.argv) == 3:
+        start = int(sys.argv[1])
+        end = int(sys.argv[2])
+        is_remote = False
+    else:
+        try:
+            start = int(os.environ.get('START_RUN'))
+            end = int(os.environ.get('END_RUN'))
+            is_remote = True
+        except Exception as e:
+            print(e)  # debug
+            print("Usage: python train.py <start> <end>")
+            raise e
 
     configs = []
     for config_file in sorted(Path("configs/runs").glob("*.yaml")):
-        num = int(config_file.stem.split("_")[0])
+        if (is_remote and not "rem" in config_file.stem.split("_")[0]) \
+            or (not is_remote and "rem" in config_file.stem.split("_")[0]):
+            continue
+        # denote remote runs eg 1rem
+        num = int(config_file.stem.split("_")[0].removesuffix("rem"))
         if start <= num <= end:
             configs.append(str(config_file))
 

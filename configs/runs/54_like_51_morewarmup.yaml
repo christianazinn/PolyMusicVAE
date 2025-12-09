@@ -1,0 +1,14 @@
+inherit: default_512
+name: "54_like_51_morewarmup"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1b_combined"
+
+model:
+  latent_dim: 128
+  beta_end: 0.2
+  free_bits: 24
+  beta_warmup_steps: 100000
+
+trainer:
+  max_epochs: 1

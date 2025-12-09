@@ -6,6 +6,7 @@ from symusic import Score, Synthesizer, BuiltInSF3
 from model import MusicVAE
 from dataset import create_dataloaders
 from interpolate import interpolate_base
+import numpy as np
 
 
 # interpolate between two given midi files and visualize the results
@@ -105,6 +106,7 @@ def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
     model.eval()
     score = Score.from_file(path)
     tokenized = tokenizer.encode(score)[0].ids[1:]  # remove BOS
+    print(tokenized)
     tensor = torch.tensor(tokenized, dtype=torch.int32).unsqueeze(0).cuda()
     with torch.no_grad():
         latent_dist, _ = model.encode(tensor)
@@ -142,9 +144,49 @@ def test_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
     plt.close()
 
 
+def test_file_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
+    model.eval()
+    score = Score.from_file(path)
+    tokenized = tokenizer.encode(score)
+
+    bar_start = 16
+    num_bars = 8
+    bar_id = tokenizer.vocab["Bar_None"]
+    track_tokens = [[], [], []]
+    reconst_tokens = [[], [], []]
+
+    for j, track in enumerate(tokenized):
+        real_track = np.array(track.ids[1:])  # remove BOS
+        bar_breaks = np.where(real_track == bar_id)[0]
+        for i in range(num_bars):
+            start = bar_breaks[i + bar_start - 1] + 1
+            end = bar_breaks[i + bar_start]
+            bar_tokens = real_track[start:end].tolist()
+            track_tokens[j].extend(bar_tokens)
+            track_tokens[j].append(bar_id)
+
+            if len(bar_tokens) > 0:
+                tensor = torch.tensor(bar_tokens, dtype=torch.int32).unsqueeze(0).cuda()
+                with torch.no_grad():
+                    latent_dist, _ = model.encode(tensor)
+                    reconstructed_ids = model.decode_autoregressive(
+                        latent_dist.sample()
+                    )
+                    rccd = reconstructed_ids.cpu().numpy().tolist()[0]
+                    reconst_tokens[j].extend(rccd)
+                    reconst_tokens[j].append(bar_id)
+            else:
+                reconst_tokens[j].append(bar_id)
+
+    original_semiscore = tokenizer.decode(track_tokens)
+    original_semiscore.dump_midi("test/reconst.mid")
+    reconst_score = tokenizer.decode(reconst_tokens)
+    reconst_score.dump_midi("test/rec.mid")
+
+
 def main():
     tokenizer = REMI()
-    model = MusicVAE.load_id(25)
+    model = MusicVAE.load_id(51)
     model.eval()
     test_interpolate(
         model,
@@ -154,7 +196,8 @@ def main():
     )
     # test_random_noise(model, tokenizer, num_samples=5)
     # test_latents(model, num_samples=1000)
-    # test_reconstruction(model, tokenizer, "test/bar_9.mid")
+    # test_reconstruction(model, tokenizer, "test/test.mid")
+    test_file_reconstruction(model, tokenizer, "test/001.mid")
 
 
 if __name__ == "__main__":

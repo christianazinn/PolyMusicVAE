@@ -111,19 +111,22 @@ def create_dataloaders(
         "collate_fn": collate_func,
     }
 
-    assert sampler_power > 0.0, "testing, this should be passed through"
+    # assert sampler_power > 0.0, "testing, this should be passed through"
 
     train_dataset = MusicDataset(train_hf)
-    ppath = f"data/train_sampler_power_{sampler_power}.pkl"
-    try:
-        print(f"attempting to load sampler from {ppath}")
-        with open(ppath, "rb") as f:
-            train_sampler = pickle.load(f)
-    except FileNotFoundError:
-        print("didn't find it, prepare to wait (a lot)")
-        train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
-        with open(ppath, "wb") as f:
-            pickle.dump(train_sampler, f)
+    if sampler_power > 0.0:
+        ppath = f"data/train_sampler_power_{sampler_power}.pkl"
+        try:
+            print(f"attempting to load sampler from {ppath}")
+            with open(ppath, "rb") as f:
+                train_sampler = pickle.load(f)
+        except FileNotFoundError:
+            print("didn't find it, prepare to wait (a lot)")
+            train_sampler = create_length_weighted_sampler(train_dataset, sampler_power)
+            with open(ppath, "wb") as f:
+                pickle.dump(train_sampler, f)
+    else:
+        train_sampler = None
     train_loader = DataLoader(
         train_dataset, sampler=train_sampler, drop_last=True, **dl_kwargs
     )

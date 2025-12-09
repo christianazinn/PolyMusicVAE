@@ -510,8 +510,8 @@ class MusicVAE(L.LightningModule):
         )
 
         if self.lr_schedule == "cosine":
-            # TODO: dumb hack, hardcoded lol
-            est_num_steps = self.trainer.max_epochs * 72162
+            # TODO: dumb hack, hardcoded lol 72162
+            est_num_steps = self.trainer.max_epochs * 341523
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=est_num_steps,
@@ -569,7 +569,7 @@ class MusicVAE(L.LightningModule):
         self._val_latent_vars = []
 
     @classmethod
-    def load_id(cls, run_id: int, checkpoints_dir: str = "checkpoints"):
+    def load_id(cls, run_id: int | str, checkpoints_dir: str = "checkpoints"):
         """Load checkpoint by run ID number."""
         checkpoint_path = Path(checkpoints_dir)
         matching = list(checkpoint_path.glob(f"{run_id}_*"))
