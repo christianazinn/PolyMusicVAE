@@ -1,0 +1,14 @@
+inherit: default_512
+name: "57_like_53_except_latent_d256"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1b_combined"
+
+model:
+  latent_dim: 256
+  beta_end: 0.2
+  free_bits: 24
+  beta_warmup_steps: 100000
+
+trainer:
+  max_epochs: 1

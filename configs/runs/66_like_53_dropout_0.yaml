@@ -1,13 +1,14 @@
 inherit: default_512
-name: "55_like_50_except_latent_d256"
+name: "66_like_53_dropout_0"
 
 data:
   ds_path: "/home/christian/vae/data_nb_1b_combined"
 
 model:
-  latent_dim: 256
   beta_end: 0.2
   free_bits: 24
+  beta_warmup_steps: 100000
+  dropout: 0
 
 trainer:
   max_epochs: 1
