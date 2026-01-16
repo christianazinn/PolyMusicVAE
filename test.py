@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import torch
-from miditok import REMI
+from miditok import REMI, TokenizerConfig
 from os import PathLike
 from symusic import Score, Synthesizer, BuiltInSF3
 from model import MusicVAE
@@ -186,7 +186,7 @@ def test_file_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
 
 def main():
     tokenizer = REMI()
-    model = MusicVAE.load_id(51)
+    model = MusicVAE.load_id(70)
     model.eval()
     test_interpolate(
         model,
@@ -202,3 +202,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # tokenizer = REMI(TokenizerConfig(use_rests=True))
+    # print(tokenizer.vocab)

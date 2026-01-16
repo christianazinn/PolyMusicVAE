@@ -59,6 +59,7 @@ class MusicVAE(L.LightningModule):
         lr_schedule: str = "cosine",
         warmup_steps: int = 4000,
         input_dropout: float = 0.0,
+        steps_per_epoch_est: int = 341523,  # this number is for data_nb_1b_combined
         **kwargs,
     ):
         super().__init__()
@@ -84,6 +85,7 @@ class MusicVAE(L.LightningModule):
         self.lr_schedule = lr_schedule
         self.warmup_steps = warmup_steps
         self.input_dropout = input_dropout
+        self.steps_per_epoch_est = steps_per_epoch_est
 
         # tracking
         self._val_latent_means = []
@@ -510,8 +512,8 @@ class MusicVAE(L.LightningModule):
         )
 
         if self.lr_schedule == "cosine":
-            # TODO: dumb hack, hardcoded lol 72162
-            est_num_steps = self.trainer.max_epochs * 341523
+            # TODO: dumb hack, hardcoded lol 72162 or 341523
+            est_num_steps = self.trainer.max_epochs * self.steps_per_epoch_est
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=est_num_steps,

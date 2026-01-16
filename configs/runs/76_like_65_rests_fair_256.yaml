@@ -1,0 +1,14 @@
+inherit: default_512
+name: "76_like_65_rests_fair_256"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1_rests_combined"
+
+model:
+  beta_end: 0.2
+  free_bits: 24
+  beta_warmup_steps: 100000
+  steps_per_epoch_est: 146455
+
+trainer:
+  max_epochs: 5

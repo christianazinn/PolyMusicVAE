@@ -1,0 +1,13 @@
+inherit: default_512
+name: "69_like_53_beta_0.4_warmedup"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1b_combined"
+
+model:
+  beta_end: 0.4
+  free_bits: 24
+  beta_warmup_steps: 100000
+
+trainer:
+  max_epochs: 1

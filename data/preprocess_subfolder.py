@@ -4,7 +4,7 @@ import os
 import json
 from dataclasses import dataclass
 from datasets import Dataset
-from miditok import REMI, TokSequence
+from miditok import REMI, TokSequence, TokenizerConfig
 from pathlib import Path
 from symusic import Score
 from tqdm import tqdm
@@ -88,7 +88,11 @@ def main():
         sys.exit(1)
 
     num_bars = int(num_bars_str)
-    tokenizer = REMI()
+
+    # 12/19/2025 test
+    config = TokenizerConfig(use_rests=True)
+
+    tokenizer = REMI(config)
     config = PreprocessConfig(
         num_bars=num_bars,
         vocab_size=len(tokenizer.vocab),
@@ -101,7 +105,7 @@ def main():
 
     data_path = Path(f"/mnt/t/midi/lmd_full/{split}")
     # b/c of how it's launched, safer to abspath
-    out_path = Path(f"/home/christian/vae/data_nb_{num_bars}b/{split}")
+    out_path = Path(f"/home/christian/vae/data_nb_{num_bars}_rests/{split}")
     out_path.mkdir(exist_ok=True, parents=True)
 
     print("Globbing...")
