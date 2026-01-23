@@ -1,0 +1,23 @@
+# Train multi-query VAE from scratch with low beta
+# Alternative to staged training - simpler but may not achieve same quality
+
+inherit: default_512
+name: "78_multiquery_256_vae"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1_rests_combined"
+
+model:
+  d_model: 512
+  latent_dim: 256
+  num_queries: 4
+  training_mode: "vae"
+  kl_reduction: "per_seq"  # PhraseVAE-style
+  beta_start: 0.0
+  beta_end: 0.01  # Very low beta
+  beta_warmup_steps: 100000
+  free_bits: 32  # Total budget per sequence
+  steps_per_epoch_est: 146455
+
+trainer:
+  max_epochs: 5

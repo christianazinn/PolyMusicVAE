@@ -1,0 +1,28 @@
+# Stage 4: Compress latent space from 128 -> 64
+# This is the target dimension for latent diffusion
+#
+# Start from Stage 3 checkpoint
+
+inherit: default_512
+name: "staged_4_compress_64"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1_combined"
+
+model:
+  latent_dim: 64
+  num_queries: 4
+  training_mode: "ae"
+  beta_end: 0.0
+  free_bits: null
+
+trainer:
+  max_epochs: 2
+
+staged_training:
+  enabled: true
+  source_run_id: 90
+  new_latent_dim: 64
+  training_mode: "ae"
+  freeze_encoder: true
+  freeze_decoder: false

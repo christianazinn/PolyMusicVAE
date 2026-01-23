@@ -35,6 +35,66 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class MultiQueryBottleneck(nn.Module):
+    """
+    Multi-query compression mechanism from PhraseVAE.
+    Uses learnable query vectors that attend to encoder output to extract
+    multiple complementary representations before projecting to latent space.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_queries: int = 4,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_queries = num_queries
+
+        # Learnable query embeddings
+        self.queries = nn.Parameter(torch.randn(num_queries, d_model) * 0.02)
+
+        # Cross-attention: queries attend to encoder output
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=False,
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, encoder_output, padding_mask=None):
+        """
+        Args:
+            encoder_output: [seq_len, batch_size, d_model]
+            padding_mask: [batch_size, seq_len] - True for padded positions
+        Returns:
+            pooled: [batch_size, num_queries * d_model]
+            query_outputs: [num_queries, batch_size, d_model] (for decoder memory)
+        """
+        batch_size = encoder_output.size(1)
+
+        # Expand queries for batch: [num_queries, batch_size, d_model]
+        queries = self.queries.unsqueeze(1).expand(-1, batch_size, -1)
+
+        # Cross-attention: queries attend to encoder output
+        # query: [num_queries, batch, d_model], key/value: [seq_len, batch, d_model]
+        attended, _ = self.cross_attention(
+            query=queries,
+            key=encoder_output,
+            value=encoder_output,
+            key_padding_mask=padding_mask,
+        )
+        attended = self.norm(attended + queries)  # residual connection
+
+        # Concatenate all query outputs: [batch_size, num_queries * d_model]
+        pooled = attended.permute(1, 0, 2).reshape(batch_size, -1)
+
+        return pooled, attended
+
+
 class MusicVAE(L.LightningModule):
     def __init__(
         self,
@@ -60,6 +120,17 @@ class MusicVAE(L.LightningModule):
         warmup_steps: int = 4000,
         input_dropout: float = 0.0,
         steps_per_epoch_est: int = 341523,  # this number is for data_nb_1b_combined
+        # Multi-query bottleneck settings
+        num_queries: int = 1,  # 1 = mean pooling (original), >1 = multi-query attention
+        # Staged training settings
+        training_mode: str = "vae",  # "ae" (no KL) or "vae" (with KL)
+        freeze_encoder: bool = False,
+        freeze_decoder: bool = False,
+        freeze_bottleneck: bool = False,  # freeze encoder_to_latent and latent_to_decoder
+        # KL computation mode
+        kl_reduction: str = "per_dim",  # "per_dim" (original) or "per_seq" (PhraseVAE-style)
+        # Progressive bottleneck: intermediate dim before final latent projection
+        bottleneck_dim: int | None = None,  # if set, adds intermediate layer
         **kwargs,
     ):
         super().__init__()
@@ -87,6 +158,12 @@ class MusicVAE(L.LightningModule):
         self.input_dropout = input_dropout
         self.steps_per_epoch_est = steps_per_epoch_est
 
+        # Multi-query and staged training settings
+        self.num_queries = num_queries
+        self.training_mode = training_mode
+        self.kl_reduction = kl_reduction
+        self.bottleneck_dim = bottleneck_dim
+
         # tracking
         self._val_latent_means = []
         self._val_latent_vars = []
@@ -104,8 +181,37 @@ class MusicVAE(L.LightningModule):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, n_encoder_layers)
 
-        self.encoder_to_latent = nn.Linear(d_model, latent_dim * 2)  # mu and logvar
-        self.latent_to_decoder = nn.Linear(latent_dim, d_model)
+        # Multi-query bottleneck or mean pooling
+        if num_queries > 1:
+            self.multi_query = MultiQueryBottleneck(
+                d_model=d_model,
+                num_queries=num_queries,
+                n_heads=n_heads,
+                dropout=dropout,
+            )
+            encoder_output_dim = d_model * num_queries
+        else:
+            self.multi_query = None
+            encoder_output_dim = d_model
+
+        # Progressive bottleneck: optional intermediate compression layer
+        if bottleneck_dim is not None:
+            self.bottleneck_compress = nn.Sequential(
+                nn.Linear(encoder_output_dim, bottleneck_dim),
+                nn.GELU(),
+                nn.Linear(bottleneck_dim, latent_dim * 2),
+            )
+            self.encoder_to_latent = None  # not used when bottleneck_dim is set
+        else:
+            self.bottleneck_compress = None
+            self.encoder_to_latent = nn.Linear(encoder_output_dim, latent_dim * 2)
+
+        # Decoder input projection
+        if num_queries > 1:
+            # Project latent back to num_queries memory tokens for decoder
+            self.latent_to_decoder = nn.Linear(latent_dim, d_model * num_queries)
+        else:
+            self.latent_to_decoder = nn.Linear(latent_dim, d_model)
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
@@ -121,7 +227,45 @@ class MusicVAE(L.LightningModule):
 
         self._init_weights()
 
+        # Apply freezing after init
+        if freeze_encoder:
+            self._freeze_encoder()
+        if freeze_decoder:
+            self._freeze_decoder()
+        if freeze_bottleneck:
+            self._freeze_bottleneck()
+
         self.training_step_count = 0
+
+    def _freeze_encoder(self):
+        """Freeze encoder components (embedding, pos encoding, transformer encoder)."""
+        for param in self.token_embedding.parameters():
+            param.requires_grad = False
+        for param in self.pos_encoding.parameters():
+            param.requires_grad = False
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        if self.multi_query is not None:
+            for param in self.multi_query.parameters():
+                param.requires_grad = False
+
+    def _freeze_decoder(self):
+        """Freeze decoder components."""
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        for param in self.output_projection.parameters():
+            param.requires_grad = False
+
+    def _freeze_bottleneck(self):
+        """Freeze bottleneck projection layers."""
+        if self.encoder_to_latent is not None:
+            for param in self.encoder_to_latent.parameters():
+                param.requires_grad = False
+        if self.bottleneck_compress is not None:
+            for param in self.bottleneck_compress.parameters():
+                param.requires_grad = False
+        for param in self.latent_to_decoder.parameters():
+            param.requires_grad = False
 
     def _init_weights(self):
         for module in self.modules():
@@ -164,27 +308,52 @@ class MusicVAE(L.LightningModule):
         embedded = self.pos_encoding(embedded)
         encoded = self.encoder(embedded, src_key_padding_mask=padding_mask)
 
-        if lengths is not None:
+        # Pooling: multi-query attention or mean pooling
+        if self.multi_query is not None:
+            # Multi-query: queries attend to encoder output
+            pooled, _ = self.multi_query(encoded, padding_mask=padding_mask)
+        elif lengths is not None:
+            # Mean pooling with explicit lengths
             pooled = []
             for i, length in enumerate(lengths):
                 seq_repr = encoded[:length, i].mean(dim=0)
                 pooled.append(seq_repr)
             pooled = torch.stack(pooled)
         else:
+            # Mean pooling with padding mask
             mask = padding_mask.transpose(0, 1).unsqueeze(-1)
             masked_encoded = encoded.masked_fill(mask, 0)
-            valid_lengths = (
-                (~padding_mask).sum(dim=1, keepdim=True).float().transpose(0, 1)
-            )
-            pooled = masked_encoded.sum(dim=0) / valid_lengths.squeeze(0)
+            # valid_lengths: [batch_size, 1] for broadcasting with [batch_size, d_model]
+            valid_lengths = (~padding_mask).sum(dim=1, keepdim=True).float()
+            pooled = masked_encoded.sum(dim=0) / valid_lengths.clamp(min=1)
 
-        latent_params = self.encoder_to_latent(pooled)
+        # Project to latent space (with optional intermediate bottleneck)
+        if self.bottleneck_compress is not None:
+            latent_params = self.bottleneck_compress(pooled)
+        else:
+            latent_params = self.encoder_to_latent(pooled)
+
         mu, logvar = latent_params.chunk(2, dim=-1)
 
         std = torch.exp(0.5 * logvar)
         dist = Normal(mu, std)
 
         return dist, encoded
+
+    def _prepare_decoder_memory(self, z):
+        """Project latent to decoder memory, handling multi-query case."""
+        batch_size = z.shape[0]
+        memory = self.latent_to_decoder(z)
+
+        if self.num_queries > 1:
+            # Reshape to [num_queries, batch_size, d_model]
+            memory = memory.view(batch_size, self.num_queries, self.d_model)
+            memory = memory.permute(1, 0, 2)  # [num_queries, batch, d_model]
+        else:
+            # Single memory token: [1, batch_size, d_model]
+            memory = memory.unsqueeze(0)
+
+        return memory
 
     def decode_teacher_forcing(self, z, target_sequences):
         batch_size, seq_len = target_sequences.shape
@@ -205,7 +374,7 @@ class MusicVAE(L.LightningModule):
         embedded = self.token_embedding(decoder_input).transpose(0, 1)
         embedded = self.pos_encoding(embedded)
 
-        memory = self.latent_to_decoder(z).unsqueeze(0)
+        memory = self._prepare_decoder_memory(z)
 
         decoded = self.decoder(
             embedded, memory, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask
@@ -223,7 +392,7 @@ class MusicVAE(L.LightningModule):
 
         generated = torch.full((batch_size, 1), self.bos_id, device=self.device)
 
-        memory = self.latent_to_decoder(z).unsqueeze(0)
+        memory = self._prepare_decoder_memory(z)
 
         for step in range(max_length):
             seq_len = generated.shape[1]
@@ -316,28 +485,52 @@ class MusicVAE(L.LightningModule):
             reduction="mean",
         )
 
+        # In AE mode, skip KL computation entirely
+        if self.training_mode == "ae":
+            self.log("debug/training_mode", 0.0, on_step=True)  # 0 = AE
+            return reconstruction_loss, reconstruction_loss, torch.tensor(0.0, device=self.device)
+
+        self.log("debug/training_mode", 1.0, on_step=True)  # 1 = VAE
+
         prior = Normal(
             torch.zeros_like(latent_dist.mean), torch.ones_like(latent_dist.stddev)
         )
 
+        # Compute KL both ways for logging
         kl_per_example = (
             torch.distributions.kl_divergence(latent_dist, prior).sum(dim=-1).mean()
         )
-        if hasattr(self, "log"):
-            self.log("debug/kl_total_per_example", kl_per_example.item(), on_step=True)
         kl_per_dim = torch.distributions.kl_divergence(latent_dist, prior).mean()
 
-        kl_before_free_bits = kl_per_dim.item()
+        if hasattr(self, "log"):
+            self.log("debug/kl_total_per_example", kl_per_example.item(), on_step=True)
+            self.log("debug/kl_per_dim", kl_per_dim.item(), on_step=True)
 
+        # Select KL reduction mode
+        if self.kl_reduction == "per_seq":
+            # PhraseVAE-style: sum over dims, mean over batch
+            # beta is applied to the total KL per sequence
+            kl_raw = kl_per_example
+            kl_before_free_bits = kl_raw.item()
+        else:
+            # Original: mean over both dims and batch
+            kl_raw = kl_per_dim
+            kl_before_free_bits = kl_raw.item()
+
+        # Apply free bits
         if self.free_bits is not None:
-            free_bits = self.free_bits / self.latent_dim
-            kl_loss = torch.max(
-                kl_per_dim - free_bits, torch.zeros_like(kl_per_dim)
-            ).mean()
+            if self.kl_reduction == "per_seq":
+                # Free bits as total budget per sequence
+                free_bits_threshold = self.free_bits
+            else:
+                # Free bits per dimension
+                free_bits_threshold = self.free_bits / self.latent_dim
 
-            # dude actually what the fuck
+            kl_loss = torch.max(
+                kl_raw - free_bits_threshold, torch.zeros_like(kl_raw)
+            )
+
             kl_after_free_bits = kl_loss.item()
-            free_bits_threshold = free_bits
             reduction_pct = 100 * (
                 1 - kl_after_free_bits / (kl_before_free_bits + 1e-8)
             )
@@ -348,7 +541,7 @@ class MusicVAE(L.LightningModule):
                 self.log("debug/free_bits_threshold", free_bits_threshold, on_step=True)
                 self.log("debug/kl_reduction_pct", reduction_pct, on_step=True)
         else:
-            kl_loss = kl_per_dim
+            kl_loss = kl_raw
 
         total_loss = reconstruction_loss + beta * kl_loss
 
@@ -583,6 +776,163 @@ class MusicVAE(L.LightningModule):
 
         ckpt_file = matching[0] / "last.ckpt"
         return cls.load_from_checkpoint(str(ckpt_file))
+
+    @classmethod
+    def load_for_stage(
+        cls,
+        checkpoint_path: str,
+        new_latent_dim: int | None = None,
+        new_bottleneck_dim: int | None = None,
+        new_num_queries: int | None = None,
+        training_mode: str = "vae",
+        freeze_encoder: bool = False,
+        freeze_decoder: bool = False,
+        freeze_bottleneck: bool = False,
+        kl_reduction: str | None = None,
+        learning_rate: float | None = None,
+        beta_start: float | None = None,
+        beta_end: float | None = None,
+        beta_warmup_steps: int | None = None,
+        free_bits: int | None = None,
+    ):
+        """
+        Load a checkpoint and modify architecture for next training stage.
+
+        This enables progressive training pipelines like PhraseVAE:
+        - Stage 1 (AE): Load pretrained model, set training_mode="ae", optionally add multi-query
+        - Stage 2 (Compress): Reduce latent_dim, freeze encoder, train bottleneck
+        - Stage 3 (VAE): Set training_mode="vae", unfreeze, fine-tune with KL
+
+        Args:
+            checkpoint_path: Path to checkpoint file
+            new_latent_dim: New latent dimension (for compression)
+            new_bottleneck_dim: Intermediate bottleneck dimension
+            new_num_queries: Number of queries (to add multi-query to existing model)
+            training_mode: "ae" or "vae"
+            freeze_encoder: Freeze encoder weights
+            freeze_decoder: Freeze decoder weights
+            freeze_bottleneck: Freeze bottleneck projection weights
+            kl_reduction: "per_dim" or "per_seq"
+            learning_rate: New learning rate for this stage
+            beta_start/beta_end/beta_warmup_steps: New KL schedule
+            free_bits: New free bits value
+
+        Returns:
+            Modified model with new architecture/settings
+        """
+        # Load checkpoint to get hparams and state dict
+        # weights_only=False needed for Lightning checkpoints which contain non-tensor data
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        hparams = checkpoint["hyper_parameters"]
+        old_state_dict = checkpoint["state_dict"]
+
+        # Determine new configuration
+        old_latent_dim = hparams["latent_dim"]
+        old_num_queries = hparams.get("num_queries", 1)
+
+        latent_dim = new_latent_dim if new_latent_dim is not None else old_latent_dim
+        num_queries = new_num_queries if new_num_queries is not None else old_num_queries
+
+        # Update hparams for new model
+        new_hparams = hparams.copy()
+        new_hparams["latent_dim"] = latent_dim
+        new_hparams["num_queries"] = num_queries
+        new_hparams["training_mode"] = training_mode
+        new_hparams["freeze_encoder"] = freeze_encoder
+        new_hparams["freeze_decoder"] = freeze_decoder
+        new_hparams["freeze_bottleneck"] = freeze_bottleneck
+
+        if new_bottleneck_dim is not None:
+            new_hparams["bottleneck_dim"] = new_bottleneck_dim
+        if kl_reduction is not None:
+            new_hparams["kl_reduction"] = kl_reduction
+        if learning_rate is not None:
+            new_hparams["learning_rate"] = learning_rate
+        if beta_start is not None:
+            new_hparams["beta_start"] = beta_start
+        if beta_end is not None:
+            new_hparams["beta_end"] = beta_end
+        if beta_warmup_steps is not None:
+            new_hparams["beta_warmup_steps"] = beta_warmup_steps
+        if free_bits is not None:
+            new_hparams["free_bits"] = free_bits
+
+        # Reset training step count for new stage
+        new_hparams.pop("training_step_count", None)
+
+        # Create new model with updated architecture
+        model = cls(**new_hparams)
+
+        # Load compatible weights from old checkpoint
+        new_state_dict = model.state_dict()
+        loaded_keys = []
+        skipped_keys = []
+
+        for key, value in old_state_dict.items():
+            if key in new_state_dict:
+                if new_state_dict[key].shape == value.shape:
+                    new_state_dict[key] = value
+                    loaded_keys.append(key)
+                else:
+                    skipped_keys.append(f"{key} (shape mismatch: {value.shape} vs {new_state_dict[key].shape})")
+            else:
+                skipped_keys.append(f"{key} (not in new model)")
+
+        model.load_state_dict(new_state_dict)
+
+        print(f"Loaded {len(loaded_keys)} parameters from checkpoint")
+        if skipped_keys:
+            print(f"Skipped {len(skipped_keys)} parameters (will be randomly initialized):")
+            for key in skipped_keys[:10]:  # Show first 10
+                print(f"  - {key}")
+            if len(skipped_keys) > 10:
+                print(f"  ... and {len(skipped_keys) - 10} more")
+
+        # Log configuration changes
+        changes = []
+        if new_latent_dim is not None and new_latent_dim != old_latent_dim:
+            changes.append(f"latent_dim: {old_latent_dim} -> {latent_dim}")
+        if new_num_queries is not None and new_num_queries != old_num_queries:
+            changes.append(f"num_queries: {old_num_queries} -> {num_queries}")
+        if training_mode != hparams.get("training_mode", "vae"):
+            changes.append(f"training_mode: {hparams.get('training_mode', 'vae')} -> {training_mode}")
+
+        if changes:
+            print("Configuration changes:")
+            for change in changes:
+                print(f"  - {change}")
+
+        return model
+
+    @classmethod
+    def load_id_for_stage(
+        cls,
+        run_id: int | str,
+        checkpoints_dir: str = "checkpoints",
+        **stage_kwargs,
+    ):
+        """
+        Convenience method combining load_id and load_for_stage.
+
+        Example:
+            model = MusicVAE.load_id_for_stage(
+                76,
+                new_latent_dim=256,
+                new_num_queries=4,
+                training_mode="ae",
+                freeze_encoder=True,
+            )
+        """
+        checkpoint_path = Path(checkpoints_dir)
+        matching = list(checkpoint_path.glob(f"{run_id}_*"))
+
+        if not matching:
+            raise FileNotFoundError(f"No checkpoint folder found for run_id {run_id}")
+        if len(matching) > 1:
+            raise ValueError(f"Multiple folders found for run_id {run_id}: {matching}")
+
+        ckpt_file = matching[0] / "last.ckpt"
+        return cls.load_for_stage(str(ckpt_file), **stage_kwargs)
 
 
 def get_callbacks():

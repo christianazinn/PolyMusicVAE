@@ -25,7 +25,42 @@ def run_single_training(config_path: str):
     train_loader, val_loader, _, config_data = create_dataloaders(**config["data"])
 
     model_config = {**config["model"], **config_data}
-    model = MusicVAE(**model_config)
+
+    # Check for staged training configuration
+    staged_config = config.get("staged_training")
+    if staged_config and staged_config.get("enabled", False):
+        print("\n=== STAGED TRAINING MODE ===")
+        source_run_id = staged_config.get("source_run_id")
+        source_checkpoint = staged_config.get("source_checkpoint")
+
+        if source_run_id:
+            checkpoint_dir = Path("checkpoints")
+            matching = list(checkpoint_dir.glob(f"{source_run_id}_*"))
+            if not matching:
+                raise FileNotFoundError(f"No checkpoint folder found for run_id {source_run_id}")
+            source_checkpoint = str(matching[0] / "last.ckpt")
+            print(f"Loading from run {source_run_id}: {source_checkpoint}")
+        elif source_checkpoint:
+            print(f"Loading from checkpoint: {source_checkpoint}")
+        else:
+            raise ValueError("staged_training requires either source_run_id or source_checkpoint")
+
+        # Build stage kwargs from config
+        stage_kwargs = {}
+        stage_fields = [
+            "new_latent_dim", "new_bottleneck_dim", "new_num_queries",
+            "training_mode", "freeze_encoder", "freeze_decoder", "freeze_bottleneck",
+            "kl_reduction", "learning_rate", "beta_start", "beta_end",
+            "beta_warmup_steps", "free_bits",
+        ]
+        for field in stage_fields:
+            if field in staged_config:
+                stage_kwargs[field] = staged_config[field]
+
+        model = MusicVAE.load_for_stage(source_checkpoint, **stage_kwargs)
+        print(f"=== END STAGED TRAINING SETUP ===\n")
+    else:
+        model = MusicVAE(**model_config)
 
     trainer_config = config["trainer"].copy()
     trainer_config["logger"] = WandbLogger(

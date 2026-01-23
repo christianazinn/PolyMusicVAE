@@ -1,0 +1,32 @@
+# Stage 1: Add multi-query bottleneck, train as AE (no KL)
+# This stage adds the multi-query compression mechanism and trains
+# without KL regularization to achieve near-perfect reconstruction.
+#
+# Start from a well-trained VAE checkpoint (e.g., run 76)
+
+inherit: default_512
+name: "staged_1_ae_multiquery"
+
+data:
+  ds_path: "/home/christian/vae/data_nb_1_combined"
+
+model:
+  # Keep latent_dim at 512 for this stage
+  latent_dim: 512
+  num_queries: 4
+  training_mode: "ae"  # No KL loss
+  kl_reduction: "per_dim"
+  beta_end: 0.0
+  free_bits: null
+
+trainer:
+  max_epochs: 2
+
+# Staged training: load from existing checkpoint
+staged_training:
+  enabled: true
+  source_run_id: 70  # Your best run
+  new_num_queries: 4
+  training_mode: "ae"
+  freeze_encoder: false  # Train encoder to work with multi-query
+  freeze_decoder: false
