@@ -1,11 +1,12 @@
 import torch
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.nn.utils.rnn import pad_sequence
-from datasets import load_from_disk, Dataset as HFDataset
+from datasets import load_from_disk, load_dataset, Dataset as HFDataset
 from os import PathLike
 from typing import Dict, List, Optional, Tuple
 import json
 import pickle
+from functools import partial
 
 
 class MusicDataset(Dataset):
@@ -41,7 +42,13 @@ def collate_fn(batch: List[Dict], pad_token_id: int = 0):
 def create_splits(
     ds_path: PathLike, val_split: float = 0.1, test_split: float = 0.1, seed: int = 42
 ) -> Tuple[HFDataset, HFDataset, HFDataset, Dict]:
-    dataset = load_from_disk(ds_path)
+    try:
+        dataset = load_from_disk(ds_path)
+        did = dataset.info.description
+    except Exception:
+        dataset = load_dataset(ds_path)["train"]
+        # stupid manual hack
+        did = '{"num_bars": 1, "vocab_size": 284, "bar_id": 4, "bos_id": 1, "eos_id": 2, "pad_id": 0, "max_seq_len": 256}'
     if test_split > 0:
         train_val_dataset = dataset.train_test_split(test_size=test_split, seed=seed)
         test_dataset = train_val_dataset["test"]
@@ -70,7 +77,7 @@ def create_splits(
         train_dataset,
         val_dataset,
         test_dataset,
-        json.loads(dataset.info.description),
+        json.loads(did),
     )
 
 
@@ -103,7 +110,7 @@ def create_dataloaders(
         ds_path, val_split, test_split, seed
     )
 
-    collate_func = lambda batch: collate_fn(batch, config["pad_id"])
+    collate_func = partial(collate_fn, pad_id=config["pad_id"])
     dl_kwargs = {
         "batch_size": batch_size,
         "num_workers": num_workers,
