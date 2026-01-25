@@ -6,8 +6,10 @@ from symusic import Score, Synthesizer, BuiltInSF3
 from model import MusicVAE
 from dataset import create_dataloaders
 from interpolate import interpolate_base
+from utils import extract_notes, compute_f1
 import numpy as np
 from tqdm import tqdm
+import argparse
 
 
 # interpolate between two given midi files and visualize the results
@@ -185,52 +187,7 @@ def test_file_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
     reconst_score.dump_midi("test/rec.mid")
 
 
-def _extract_notes(score: Score, mode: str = "op") -> set:
-    """
-    Extract notes from a Score as a set of tuples for F1 comparison.
-
-    Args:
-        score: symusic Score object
-        mode: "op" for (onset, pitch) or "opd" for (onset, pitch, duration)
-
-    Returns:
-        Set of tuples representing notes
-    """
-    notes = set()
-    for track in score.tracks:
-        for note in track.notes:
-            if mode == "op":
-                notes.add((note.time, note.pitch))
-            elif mode == "opd":
-                notes.add((note.time, note.pitch, note.duration))
-            else:
-                raise ValueError(f"mode must be 'op' or 'opd', got {mode}")
-    return notes
-
-
-def _compute_f1(original_notes: set, reconstructed_notes: set) -> dict:
-    """
-    Compute precision, recall, and F1 score between two sets of notes.
-
-    Returns:
-        Dict with 'precision', 'recall', 'f1', 'tp', 'fp', 'fn'
-    """
-    tp = len(original_notes & reconstructed_notes)
-    fp = len(reconstructed_notes - original_notes)
-    fn = len(original_notes - reconstructed_notes)
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-    }
+# F1 functions moved to utils.py - use extract_notes and compute_f1 from there
 
 
 def test_f1_scores(
@@ -297,9 +254,9 @@ def test_f1_scores(
             reconstructed_score = tokenizer.decode(reconstructed_ids.cpu().numpy())
 
             # Extract notes and compute F1
-            orig_notes = _extract_notes(original_score, mode)
-            recon_notes = _extract_notes(reconstructed_score, mode)
-            scores = _compute_f1(orig_notes, recon_notes)
+            orig_notes = extract_notes(original_score, mode)
+            recon_notes = extract_notes(reconstructed_score, mode)
+            scores = compute_f1(orig_notes, recon_notes)
 
             all_scores.append(scores)
             total_tp += scores["tp"]
@@ -345,9 +302,9 @@ def test_f1_scores(
                             reconstructed_score = tokenizer.decode([recon_tokens])
 
                             # Extract notes and compute F1
-                            orig_notes = _extract_notes(original_score, mode)
-                            recon_notes = _extract_notes(reconstructed_score, mode)
-                            scores = _compute_f1(orig_notes, recon_notes)
+                            orig_notes = extract_notes(original_score, mode)
+                            recon_notes = extract_notes(reconstructed_score, mode)
+                            scores = compute_f1(orig_notes, recon_notes)
 
                             all_scores.append(scores)
                             total_tp += scores["tp"]
@@ -418,9 +375,12 @@ def test_f1_scores(
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("id", type=int)
+    args = parser.parse_args()
     tokenizer = REMI()
     # 53, 70, 90 are good
-    model = MusicVAE.load_id(90)
+    model = MusicVAE.load_id(args.id)
     model.eval()
     # test_interpolate(
     #     model,

@@ -10,6 +10,12 @@ import lightning as L
 import wandb
 import torch
 
+try:
+    from miditok import REMI, TokenizerConfig
+    TOKENIZER_AVAILABLE = True
+except ImportError:
+    TOKENIZER_AVAILABLE = False
+
 
 def get_num_gpus() -> int:
     """Detect number of available GPUs."""
@@ -45,7 +51,11 @@ def run_single_training(config_path: str):
     print(f"Starting training run: {run_name}")
     print(f"{'='*60}\n")
 
-    train_loader, val_loader, _, config_data = create_dataloaders(**config["data"])
+    try:
+        train_loader, val_loader, _, config_data = create_dataloaders(**config["data"])
+    except Exception:
+        config["data"]["ds_path"] = "/app/data"
+        train_loader, val_loader, _, config_data = create_dataloaders(**config["data"])
 
     model_config = {**config["model"], **config_data}
 
@@ -84,6 +94,14 @@ def run_single_training(config_path: str):
         print(f"=== END STAGED TRAINING SETUP ===\n")
     else:
         model = MusicVAE(**model_config)
+
+    # Set up tokenizer for F1 evaluation during validation
+    if TOKENIZER_AVAILABLE:
+        ds_path = config["data"].get("ds_path", "")
+        use_rests = "rests" in str(ds_path).lower()
+        tokenizer = REMI(TokenizerConfig(use_rests=use_rests))
+        model.set_tokenizer(tokenizer)
+        print(f"Tokenizer set for F1 evaluation (use_rests={use_rests})")
 
     trainer_config = config["trainer"].copy()
     trainer_config["logger"] = WandbLogger(

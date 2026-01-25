@@ -11,6 +11,12 @@ from lightning.pytorch.callbacks import (
 import math
 from pathlib import Path
 
+try:
+    from utils import compute_batch_f1
+    F1_AVAILABLE = True
+except ImportError:
+    F1_AVAILABLE = False
+
 torch.set_float32_matmul_precision("medium")
 
 
@@ -171,6 +177,11 @@ class MusicVAE(L.LightningModule):
         self._val_latent_means = []
         self._val_latent_vars = []
 
+        # F1 evaluation (tokenizer set via set_tokenizer() after init)
+        self._tokenizer = None
+        self._val_f1_batches = 8  # number of batches to evaluate F1 on
+        self._val_f1_stats = {"tp": 0, "fp": 0, "fn": 0, "num_samples": 0}
+
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
 
@@ -276,6 +287,10 @@ class MusicVAE(L.LightningModule):
                 param.requires_grad = False
         for param in self.latent_to_decoder.parameters():
             param.requires_grad = False
+
+    def set_tokenizer(self, tokenizer):
+        """Set tokenizer for F1 evaluation during validation."""
+        self._tokenizer = tokenizer
 
     def _init_weights(self):
         for module in self.modules():
@@ -707,6 +722,37 @@ class MusicVAE(L.LightningModule):
                 outputs["latent_dist"].variance.detach().clone()
             )
 
+        # F1 evaluation on first N batches (requires tokenizer to be set)
+        if (
+            F1_AVAILABLE
+            and self._tokenizer is not None
+            and batch_idx < self._val_f1_batches
+        ):
+            # Reconstruct autoregressively for F1 evaluation
+            z = outputs["latent_dist"].mean  # use mean for deterministic eval
+            reconstructed_ids = self.decode_autoregressive(z)
+
+            # Prepare token lists for F1 computation
+            original_tokens = sequences.cpu().numpy().tolist()
+            recon_tokens = reconstructed_ids.cpu().numpy().tolist()
+
+            # Compute batch F1
+            f1_result = compute_batch_f1(
+                original_tokens=original_tokens,
+                reconstructed_tokens=recon_tokens,
+                tokenizer=self._tokenizer,
+                mode="op",
+                pad_id=self.pad_id,
+                bos_id=self.bos_id,
+                eos_id=self.eos_id,
+            )
+
+            # Accumulate stats
+            self._val_f1_stats["tp"] += f1_result["total_tp"]
+            self._val_f1_stats["fp"] += f1_result["total_fp"]
+            self._val_f1_stats["fn"] += f1_result["total_fn"]
+            self._val_f1_stats["num_samples"] += f1_result["num_samples"]
+
         return total_loss
 
     def test_step(self, batch, batch_idx):
@@ -786,6 +832,27 @@ class MusicVAE(L.LightningModule):
             (vars.mean(0) > 0.01).sum().to(torch.float32),
             sync_dist=True,
         )
+
+        # Log F1 scores if computed
+        if hasattr(self, "_val_f1_stats") and self._val_f1_stats["num_samples"] > 0:
+            tp = self._val_f1_stats["tp"]
+            fp = self._val_f1_stats["fp"]
+            fn = self._val_f1_stats["fn"]
+
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            self.log("f1op/f1", f1, sync_dist=True)
+            self.log("f1op/precision", precision, sync_dist=True)
+            self.log("f1op/recall", recall, sync_dist=True)
+            self.log("f1op/num_samples", float(self._val_f1_stats["num_samples"]), sync_dist=True)
+            self.log("f1op/tp", float(tp), sync_dist=True)
+            self.log("f1op/fp", float(fp), sync_dist=True)
+            self.log("f1op/fn", float(fn), sync_dist=True)
+
+            # Reset F1 stats for next epoch
+            self._val_f1_stats = {"tp": 0, "fp": 0, "fn": 0, "num_samples": 0}
 
         self._val_latent_means = []
         self._val_latent_vars = []
