@@ -131,6 +131,8 @@ class MusicVAE(L.LightningModule):
         kl_reduction: str = "per_dim",  # "per_dim" (original) or "per_seq" (PhraseVAE-style)
         # Progressive bottleneck: intermediate dim before final latent projection
         bottleneck_dim: int | None = None,  # if set, adds intermediate layer
+        # Latent precision: use fp32 for latent space even when model is bf16
+        latent_fp32: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -163,6 +165,7 @@ class MusicVAE(L.LightningModule):
         self.training_mode = training_mode
         self.kl_reduction = kl_reduction
         self.bottleneck_dim = bottleneck_dim
+        self.latent_fp32 = latent_fp32
 
         # tracking
         self._val_latent_means = []
@@ -195,23 +198,30 @@ class MusicVAE(L.LightningModule):
             encoder_output_dim = d_model
 
         # Progressive bottleneck: optional intermediate compression layer
+        # When latent_fp32=True, these layers are kept in fp32 for higher precision
+        latent_dtype = torch.float32 if latent_fp32 else None  # None = default dtype
         if bottleneck_dim is not None:
             self.bottleneck_compress = nn.Sequential(
                 nn.Linear(encoder_output_dim, bottleneck_dim),
                 nn.GELU(),
                 nn.Linear(bottleneck_dim, latent_dim * 2),
             )
+            if latent_dtype is not None:
+                self.bottleneck_compress = self.bottleneck_compress.to(latent_dtype)
             self.encoder_to_latent = None  # not used when bottleneck_dim is set
         else:
             self.bottleneck_compress = None
             self.encoder_to_latent = nn.Linear(encoder_output_dim, latent_dim * 2)
+            if latent_dtype is not None:
+                self.encoder_to_latent = self.encoder_to_latent.to(latent_dtype)
 
-        # Decoder input projection
+        # Decoder input projection (fp32 input -> model dtype output)
         if num_queries > 1:
-            # Project latent back to num_queries memory tokens for decoder
             self.latent_to_decoder = nn.Linear(latent_dim, d_model * num_queries)
         else:
             self.latent_to_decoder = nn.Linear(latent_dim, d_model)
+        if latent_dtype is not None:
+            self.latent_to_decoder = self.latent_to_decoder.to(latent_dtype)
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
@@ -328,10 +338,20 @@ class MusicVAE(L.LightningModule):
             pooled = masked_encoded.sum(dim=0) / valid_lengths.clamp(min=1)
 
         # Project to latent space (with optional intermediate bottleneck)
-        if self.bottleneck_compress is not None:
-            latent_params = self.bottleneck_compress(pooled)
+        # When latent_fp32=True, disable autocast so computation happens in fp32
+        if self.latent_fp32:
+            # Cast input to fp32 and disable autocast for full fp32 computation
+            pooled_fp32 = pooled.float()
+            with torch.amp.autocast(device_type='cuda', enabled=False):
+                if self.bottleneck_compress is not None:
+                    latent_params = self.bottleneck_compress(pooled_fp32)
+                else:
+                    latent_params = self.encoder_to_latent(pooled_fp32)
         else:
-            latent_params = self.encoder_to_latent(pooled)
+            if self.bottleneck_compress is not None:
+                latent_params = self.bottleneck_compress(pooled)
+            else:
+                latent_params = self.encoder_to_latent(pooled)
 
         mu, logvar = latent_params.chunk(2, dim=-1)
 
@@ -343,7 +363,14 @@ class MusicVAE(L.LightningModule):
     def _prepare_decoder_memory(self, z):
         """Project latent to decoder memory, handling multi-query case."""
         batch_size = z.shape[0]
-        memory = self.latent_to_decoder(z)
+        # When latent_fp32=True, compute in fp32 then cast output to model dtype
+        if self.latent_fp32:
+            with torch.amp.autocast(device_type='cuda', enabled=False):
+                memory = self.latent_to_decoder(z.float())
+            # Cast output to match decoder dtype (bf16/fp16)
+            memory = memory.to(self.token_embedding.weight.dtype)
+        else:
+            memory = self.latent_to_decoder(z)
 
         if self.num_queries > 1:
             # Reshape to [num_queries, batch_size, d_model]

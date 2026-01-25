@@ -8,11 +8,34 @@ from dataset import create_dataloaders
 from config_loader import load_config, print_config_types
 import lightning as L
 import wandb
+import torch
+
+
+def get_num_gpus() -> int:
+    """Detect number of available GPUs."""
+    if torch.cuda.is_available():
+        return torch.cuda.device_count()
+    return 0
 
 
 def run_single_training(config_path: str):
     wandb.finish()
     config = load_config(config_path)
+
+    # Detect GPUs and scale config accordingly
+    num_gpus = get_num_gpus()
+    if num_gpus > 1:
+        print(f"\n=== MULTI-GPU DETECTED: {num_gpus} GPUs ===")
+        # Scale devices
+        config["trainer"]["devices"] = num_gpus
+        # Scale num_workers (more workers to feed multiple GPUs)
+        if "num_workers" in config["data"]:
+            original_workers = config["data"]["num_workers"]
+            config["data"]["num_workers"] = original_workers * num_gpus
+            print(f"Scaled num_workers: {original_workers} -> {config['data']['num_workers']}")
+        print(f"Set devices: {num_gpus}")
+        print("=" * 40 + "\n")
+
     print("\n======= Config =======")
     print_config_types(config)
     print("===================\n")
