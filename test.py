@@ -7,6 +7,7 @@ from model import MusicVAE
 from dataset import create_dataloaders
 from interpolate import interpolate_base
 import numpy as np
+from tqdm import tqdm
 
 
 # interpolate between two given midi files and visualize the results
@@ -184,20 +185,254 @@ def test_file_reconstruction(model: MusicVAE, tokenizer: REMI, path: PathLike):
     reconst_score.dump_midi("test/rec.mid")
 
 
+def _extract_notes(score: Score, mode: str = "op") -> set:
+    """
+    Extract notes from a Score as a set of tuples for F1 comparison.
+
+    Args:
+        score: symusic Score object
+        mode: "op" for (onset, pitch) or "opd" for (onset, pitch, duration)
+
+    Returns:
+        Set of tuples representing notes
+    """
+    notes = set()
+    for track in score.tracks:
+        for note in track.notes:
+            if mode == "op":
+                notes.add((note.time, note.pitch))
+            elif mode == "opd":
+                notes.add((note.time, note.pitch, note.duration))
+            else:
+                raise ValueError(f"mode must be 'op' or 'opd', got {mode}")
+    return notes
+
+
+def _compute_f1(original_notes: set, reconstructed_notes: set) -> dict:
+    """
+    Compute precision, recall, and F1 score between two sets of notes.
+
+    Returns:
+        Dict with 'precision', 'recall', 'f1', 'tp', 'fp', 'fn'
+    """
+    tp = len(original_notes & reconstructed_notes)
+    fp = len(reconstructed_notes - original_notes)
+    fn = len(original_notes - reconstructed_notes)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
+def test_f1_scores(
+    model: MusicVAE,
+    tokenizer: REMI,
+    path: PathLike | None = None,
+    num_val_phrases: int | None = None,
+    ds_path: str = "/home/christian/vae/data_nb_1_combined",
+    mode: str = "op",
+    use_mean: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """
+    Compute F1 reconstruction scores for onset+pitch (op) or onset+pitch+duration (opd).
+
+    This follows the evaluation methodology from PhraseVAE where:
+    - F1op: A note is correct if onset time and pitch match
+    - F1opd: A note is correct if onset time, pitch, AND duration match
+
+    Args:
+        model: Trained MusicVAE model
+        tokenizer: REMI tokenizer (should match model's training tokenizer)
+        path: Path to a single MIDI file to evaluate (mutually exclusive with num_val_phrases)
+        num_val_phrases: Number of phrases to evaluate from validation set
+                        (mutually exclusive with path)
+        ds_path: Dataset path for loading validation phrases
+        mode: "op" for onset+pitch, "opd" for onset+pitch+duration
+        use_mean: If True, use latent mean for reconstruction; if False, sample
+        verbose: Print detailed results
+
+    Returns:
+        Dict with aggregate metrics: 'f1', 'precision', 'recall', 'num_phrases',
+        and per-phrase 'scores' list
+    """
+    if path is None and num_val_phrases is None:
+        raise ValueError("Must specify either 'path' or 'num_val_phrases'")
+    if path is not None and num_val_phrases is not None:
+        raise ValueError("Cannot specify both 'path' and 'num_val_phrases'")
+    if mode not in ("op", "opd"):
+        raise ValueError(f"mode must be 'op' or 'opd', got {mode}")
+
+    model.eval()
+    all_scores = []
+
+    # Aggregate counts for micro-averaged F1
+    total_tp, total_fp, total_fn = 0, 0, 0
+
+    with torch.no_grad():
+        if path is not None:
+            # Single file mode
+            score = Score.from_file(path)
+            tokenized = tokenizer.encode(score)[0].ids[1:]  # remove BOS
+
+            if len(tokenized) == 0:
+                raise ValueError(f"Empty tokenization for {path}")
+
+            tensor = torch.tensor(tokenized, dtype=torch.int32).unsqueeze(0).to(model.device)
+            latent_dist, _ = model.encode(tensor)
+            z = latent_dist.mean if use_mean else latent_dist.sample()
+            reconstructed_ids = model.decode_autoregressive(z)
+
+            # Decode to scores
+            original_score = tokenizer.decode([tokenized])
+            reconstructed_score = tokenizer.decode(reconstructed_ids.cpu().numpy())
+
+            # Extract notes and compute F1
+            orig_notes = _extract_notes(original_score, mode)
+            recon_notes = _extract_notes(reconstructed_score, mode)
+            scores = _compute_f1(orig_notes, recon_notes)
+
+            all_scores.append(scores)
+            total_tp += scores["tp"]
+            total_fp += scores["fp"]
+            total_fn += scores["fn"]
+
+        else:
+            # Validation set mode
+            val_loader, _, _, _ = create_dataloaders(ds_path=ds_path)
+
+            phrases_evaluated = 0
+            with tqdm(total=num_val_phrases) as pbar:
+                for batch in val_loader:
+                    if phrases_evaluated >= num_val_phrases:
+                        break
+
+                    sequences = batch["sequences"].to(model.device)
+                    batch_size = min(sequences.shape[0], num_val_phrases - phrases_evaluated)
+
+                    for i in range(batch_size):
+                        seq = sequences[i:i+1]
+
+                        # Remove padding for original
+                        seq_np = seq.cpu().numpy()[0]
+                        # Find actual length (up to first pad or end)
+                        pad_id = model.pad_id
+                        valid_mask = seq_np != pad_id
+                        if valid_mask.sum() == 0:
+                            continue
+                        valid_tokens = seq_np[valid_mask].tolist()
+
+                        # Encode and reconstruct
+                        latent_dist, _ = model.encode(seq)
+                        z = latent_dist.mean if use_mean else latent_dist.sample()
+                        reconstructed_ids = model.decode_autoregressive(z)
+
+                        # Decode to scores
+                        try:
+                            original_score = tokenizer.decode([valid_tokens])
+                            recon_tokens = reconstructed_ids.cpu().numpy()[0].tolist()
+                            # Remove BOS/EOS/PAD from reconstruction
+                            recon_tokens = [t for t in recon_tokens if t not in (0, 1, 2)]
+                            reconstructed_score = tokenizer.decode([recon_tokens])
+
+                            # Extract notes and compute F1
+                            orig_notes = _extract_notes(original_score, mode)
+                            recon_notes = _extract_notes(reconstructed_score, mode)
+                            scores = _compute_f1(orig_notes, recon_notes)
+
+                            all_scores.append(scores)
+                            total_tp += scores["tp"]
+                            total_fp += scores["fp"]
+                            total_fn += scores["fn"]
+
+                        except Exception as e:
+                            if verbose:
+                                print(f"Warning: Failed to decode phrase {phrases_evaluated + i}: {e}")
+                            continue
+
+                    phrases_evaluated += batch_size
+                    pbar.update(batch_size)
+
+    # Compute aggregate metrics (micro-averaged)
+    micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall) \
+               if (micro_precision + micro_recall) > 0 else 0.0
+
+    # Compute macro-averaged F1 (average of per-phrase F1s)
+    macro_f1 = np.mean([s["f1"] for s in all_scores]) if all_scores else 0.0
+    macro_precision = np.mean([s["precision"] for s in all_scores]) if all_scores else 0.0
+    macro_recall = np.mean([s["recall"] for s in all_scores]) if all_scores else 0.0
+
+    results = {
+        "mode": mode,
+        "num_phrases": len(all_scores),
+        "micro_f1": micro_f1,
+        "micro_precision": micro_precision,
+        "micro_recall": micro_recall,
+        "macro_f1": macro_f1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "total_tp": total_tp,
+        "total_fp": total_fp,
+        "total_fn": total_fn,
+        "scores": all_scores,
+    }
+
+    if verbose:
+        print(f"\n{'='*50}")
+        print(f"F1 Scores (mode={mode})")
+        print(f"{'='*50}")
+        print(f"Phrases evaluated: {len(all_scores)}")
+        print(f"\nMicro-averaged (note-level):")
+        print(f"  Precision: {micro_precision:.4f}")
+        print(f"  Recall:    {micro_recall:.4f}")
+        print(f"  F1:        {micro_f1:.4f}")
+        print(f"\nMacro-averaged (phrase-level):")
+        print(f"  Precision: {macro_precision:.4f}")
+        print(f"  Recall:    {macro_recall:.4f}")
+        print(f"  F1:        {macro_f1:.4f}")
+        print(f"\nNote counts:")
+        print(f"  True Positives:  {total_tp:,}")
+        print(f"  False Positives: {total_fp:,}")
+        print(f"  False Negatives: {total_fn:,}")
+
+        if all_scores:
+            f1_values = [s["f1"] for s in all_scores]
+            print(f"\nPer-phrase F1 distribution:")
+            print(f"  Min:    {min(f1_values):.4f}")
+            print(f"  Max:    {max(f1_values):.4f}")
+            print(f"  Median: {np.median(f1_values):.4f}")
+            print(f"  Std:    {np.std(f1_values):.4f}")
+
+    return results
+
+
 def main():
     tokenizer = REMI()
-    model = MusicVAE.load_id(70)
+    # 53, 70, 90 are good
+    model = MusicVAE.load_id(90)
     model.eval()
-    test_interpolate(
-        model,
-        tokenizer,
-        "test/musicvae_melody_example_1.mid",
-        "test/musicvae_melody_example_2.mid",
-    )
+    # test_interpolate(
+    #     model,
+    #     tokenizer,
+    #     "test/musicvae_melody_example_1.mid",
+    #     "test/musicvae_melody_example_2.mid",
+    # )
     # test_random_noise(model, tokenizer, num_samples=5)
     # test_latents(model, num_samples=1000)
     # test_reconstruction(model, tokenizer, "test/test.mid")
-    test_file_reconstruction(model, tokenizer, "test/001.mid")
+    # test_file_reconstruction(model, tokenizer, "test/001.mid")
+    test_f1_scores(model, tokenizer, num_val_phrases=200, mode="opd")
 
 
 if __name__ == "__main__":

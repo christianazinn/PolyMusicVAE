@@ -110,7 +110,7 @@ def create_dataloaders(
         ds_path, val_split, test_split, seed
     )
 
-    collate_func = partial(collate_fn, pad_id=config["pad_id"])
+    collate_func = partial(collate_fn, pad_token_id=config["pad_id"])
     dl_kwargs = {
         "batch_size": batch_size,
         "num_workers": num_workers,

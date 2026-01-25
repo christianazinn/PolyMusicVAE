@@ -4,7 +4,7 @@
 # Start from Stage 4 checkpoint
 
 inherit: default_512
-name: "92_staged_5_vae_finetune"
+name: "93_staged_5a_vae_finetune"
 
 data:
   ds_path: "/home/christian/vae/data_nb_1_combined"
@@ -16,19 +16,19 @@ model:
   # PhraseVAE-style KL: sum over dims, use low beta
   kl_reduction: "per_seq"
   beta_start: 0.0
-  beta_end: 0.01  # Low beta like PhraseVAE
+  beta_end: 0.01 # Low beta like PhraseVAE
   beta_warmup_steps: 50000
-  free_bits: 16  # Total free bits budget per sequence
-  learning_rate: 0.00005  # Lower LR for fine-tuning
+  free_bits: 16 # Total free bits budget per sequence
+  learning_rate: 0.00005 # Lower LR for fine-tuning
 
 trainer:
   max_epochs: 3
 
 staged_training:
   enabled: true
-  source_run_id: 91
+  source_run_id: 90
   training_mode: "vae"
-  freeze_encoder: false  # Unfreeze everything
+  freeze_encoder: false # Unfreeze everything
   freeze_decoder: false
   kl_reduction: "per_seq"
   beta_start: 0.0
