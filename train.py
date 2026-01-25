@@ -32,6 +32,9 @@ def run_single_training(config_path: str):
     num_gpus = get_num_gpus()
     if num_gpus > 1:
         print(f"\n=== MULTI-GPU DETECTED: {num_gpus} GPUs ===")
+        from lightning.pytorch.strategies import DDPStrategy
+        strategy = DDPStrategy(broadcast_buffers=False)
+        config["trainer"]["strategy"] = strategy
         # Scale devices
         config["trainer"]["devices"] = num_gpus
         # Scale num_workers (more workers to feed multiple GPUs)
@@ -109,10 +112,6 @@ def run_single_training(config_path: str):
     )
     trainer_config["callbacks"] = get_callbacks()
 
-    # hack to get it to work on the 8xA40 node
-    # from lightning.pytorch.strategies import DDPStrategy
-    # strategy = DDPStrategy(broadcast_buffers=False)
-    # trainer_config["strategy"] = strategy
     trainer = L.Trainer(use_distributed_sampler=False, **trainer_config)
 
     trainer.fit(model, train_loader, val_loader)
