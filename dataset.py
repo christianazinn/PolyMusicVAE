@@ -46,9 +46,13 @@ def create_splits(
         dataset = load_from_disk(ds_path)
         did = dataset.info.description
     except Exception:
-        dataset = load_dataset("ChristianAzinn/lakh_nb_1_combined")["train"]
-        # stupid manual hack
-        did = '{"num_bars": 1, "vocab_size": 284, "bar_id": 4, "bos_id": 1, "eos_id": 2, "pad_id": 0, "max_seq_len": 256}'
+        try:
+            dataset = load_from_disk("/app/data")
+            did = dataset.info.description
+        except Exception:
+            dataset = load_dataset("ChristianAzinn/lakh_nb_1_combined")["train"]
+            # stupid manual hack
+            did = '{"num_bars": 1, "vocab_size": 284, "bar_id": 4, "bos_id": 1, "eos_id": 2, "pad_id": 0, "max_seq_len": 256}'
     if test_split > 0:
         train_val_dataset = dataset.train_test_split(test_size=test_split, seed=seed)
         test_dataset = train_val_dataset["test"]
