@@ -2,7 +2,7 @@ import os
 import sys
 import shutil
 from pathlib import Path
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger, TensorBoardLogger, CSVLogger
 from model import MusicVAE, get_callbacks
 from dataset import create_dataloaders
 from config_loader import load_config, print_config_types
@@ -36,25 +36,17 @@ def get_num_gpus() -> int:
     return 0
 
 
-def get_num_tpus() -> int:
-    """Detect number of available TPU devices."""
-    try:
-        import torch_xla.core.xla_model as xm
-        return xm.xrt_world_size()
-    except ImportError:
-        return 0
-
-
 def run_single_training(config_path: str):
     wandb.finish()
     config = load_config(config_path)
 
     # Detect accelerators and scale config accordingly
     num_gpus = get_num_gpus()
-    num_tpus = get_num_tpus()
+    # TODO: this is actually broken lol
+    is_using_tpus = config.get("trainer", {}).get("accelerator", None) == "tpu"
 
-    if num_tpus > 0:
-        _print_rank0(f"\n=== TPU DETECTED: {num_tpus} devices ===")
+    if is_using_tpus:
+        _print_rank0(f"\n=== TPU DETECTED ===")
         # Enable XLA-friendly settings in model
         if "model" not in config:
             config["model"] = {}
@@ -144,9 +136,18 @@ def run_single_training(config_path: str):
         _print_rank0(f"Tokenizer set for F1 evaluation (use_rests={use_rests})")
 
     trainer_config = config["trainer"].copy()
-    trainer_config["logger"] = WandbLogger(
-        project="music-vae", name=run_name, log_model=True
-    )
+
+    # Use TensorBoard logger on TPU (WandB has XLA compatibility issues)
+    if is_using_tpus:
+        _print_rank0("Using TensorBoard logger (WandB incompatible with XLA)")
+        trainer_config["logger"] = TensorBoardLogger(
+            save_dir="tb_logs", name=run_name
+        )
+    else:
+        trainer_config["logger"] = WandbLogger(
+            project="music-vae", name=run_name, log_model=True
+        )
+
     trainer_config["callbacks"] = get_callbacks()
 
     trainer = L.Trainer(use_distributed_sampler=False, **trainer_config)
@@ -170,8 +171,10 @@ def run_single_training(config_path: str):
             _print_rank0(f"Moved last.ckpt to {run_dir}")
 
     _print_rank0(f"\nCompleted training run: {run_name}\n")
-    wandb.finish()
-    del trainer_config["logger"]
+    if not is_using_tpus:
+        wandb.finish()
+    if "logger" in trainer_config:
+        del trainer_config["logger"]
 
 
 """
