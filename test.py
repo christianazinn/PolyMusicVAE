@@ -78,6 +78,7 @@ def test_latents(model: MusicVAE, num_samples: int = 20):
                 lengths = lengths[:batch_size]
             latent_dist, _ = model.encode(sequences, lengths)
             latent_means.append(latent_dist.mean)
+            print(latent_dist.mean.shape)
             samples_collected += batch_size
 
     all_means = torch.cat(latent_means, dim=0)[:num_samples]
@@ -389,10 +390,12 @@ def main():
     #     "test/musicvae_melody_example_2.mid",
     # )
     # test_random_noise(model, tokenizer, num_samples=5)
-    # test_latents(model, num_samples=1000)
+    print([param.dtype for param in model.parameters()])
+    print("\n")
+    test_latents(model, num_samples=1000)
     # test_reconstruction(model, tokenizer, "test/test.mid")
     # test_file_reconstruction(model, tokenizer, "test/001.mid")
-    test_f1_scores(model, tokenizer, num_val_phrases=200, mode="opd")
+    # test_f1_scores(model, tokenizer, num_val_phrases=200, mode="opd")
 
 
 if __name__ == "__main__":

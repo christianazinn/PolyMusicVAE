@@ -27,6 +27,7 @@ trainer:
 
 staged_training:
   enabled: true
+  new_latent_dim: 64
   source_run_id: 90
   training_mode: "vae"
   freeze_encoder: false # Unfreeze everything
