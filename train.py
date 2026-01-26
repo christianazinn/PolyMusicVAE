@@ -17,6 +17,18 @@ except ImportError:
     TOKENIZER_AVAILABLE = False
 
 
+def _is_main_process() -> bool:
+    """Check if this is the main process in distributed training."""
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    return int(rank) == 0
+
+
+def _print_rank0(*args, **kwargs):
+    """Print only from rank 0 in distributed settings."""
+    if _is_main_process():
+        print(*args, **kwargs)
+
+
 def get_num_gpus() -> int:
     """Detect number of available GPUs."""
     if torch.cuda.is_available():
@@ -24,14 +36,38 @@ def get_num_gpus() -> int:
     return 0
 
 
+def get_num_tpus() -> int:
+    """Detect number of available TPU devices."""
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xrt_world_size()
+    except ImportError:
+        return 0
+
+
 def run_single_training(config_path: str):
     wandb.finish()
     config = load_config(config_path)
 
-    # Detect GPUs and scale config accordingly
+    # Detect accelerators and scale config accordingly
     num_gpus = get_num_gpus()
-    if num_gpus > 1:
-        print(f"\n=== MULTI-GPU DETECTED: {num_gpus} GPUs ===")
+    num_tpus = get_num_tpus()
+
+    if num_tpus > 0:
+        _print_rank0(f"\n=== TPU DETECTED: {num_tpus} devices ===")
+        # Enable XLA-friendly settings in model
+        if "model" not in config:
+            config["model"] = {}
+        config["model"]["xla_mode"] = True
+        config["model"]["skip_ar_eval"] = True  # Skip expensive AR decode on TPU
+        # Use fixed-length padding to avoid recompilation from varying batch shapes
+        if "data" not in config:
+            config["data"] = {}
+        config["data"]["fixed_length"] = config["model"].get("max_seq_len", 256)
+        _print_rank0(f"Enabled XLA mode, skipped AR eval, fixed_length={config['data']['fixed_length']}")
+        _print_rank0("=" * 40 + "\n")
+    elif num_gpus > 1:
+        _print_rank0(f"\n=== MULTI-GPU DETECTED: {num_gpus} GPUs ===")
         from lightning.pytorch.strategies import DDPStrategy
         strategy = DDPStrategy(broadcast_buffers=False)
         config["trainer"]["strategy"] = strategy
@@ -41,18 +77,19 @@ def run_single_training(config_path: str):
         if "num_workers" in config["data"]:
             original_workers = config["data"]["num_workers"]
             config["data"]["num_workers"] = original_workers * num_gpus
-            print(f"Scaled num_workers: {original_workers} -> {config['data']['num_workers']}")
-        print(f"Set devices: {num_gpus}")
-        print("=" * 40 + "\n")
+            _print_rank0(f"Scaled num_workers: {original_workers} -> {config['data']['num_workers']}")
+        _print_rank0(f"Set devices: {num_gpus}")
+        _print_rank0("=" * 40 + "\n")
 
-    print("\n======= Config =======")
-    print_config_types(config)
-    print("===================\n")
+    _print_rank0("\n======= Config =======")
+    if _is_main_process():
+        print_config_types(config)
+    _print_rank0("===================\n")
 
     run_name = config["name"]
-    print(f"{'='*60}")
-    print(f"Starting training run: {run_name}")
-    print(f"{'='*60}\n")
+    _print_rank0(f"{'='*60}")
+    _print_rank0(f"Starting training run: {run_name}")
+    _print_rank0(f"{'='*60}\n")
 
     try:
         train_loader, val_loader, _, config_data = create_dataloaders(**config["data"])
@@ -65,7 +102,7 @@ def run_single_training(config_path: str):
     # Check for staged training configuration
     staged_config = config.get("staged_training")
     if staged_config and staged_config.get("enabled", False):
-        print("\n=== STAGED TRAINING MODE ===")
+        _print_rank0("\n=== STAGED TRAINING MODE ===")
         source_run_id = staged_config.get("source_run_id")
         source_checkpoint = staged_config.get("source_checkpoint")
 
@@ -75,9 +112,9 @@ def run_single_training(config_path: str):
             if not matching:
                 raise FileNotFoundError(f"No checkpoint folder found for run_id {source_run_id}")
             source_checkpoint = str(matching[0] / "last.ckpt")
-            print(f"Loading from run {source_run_id}: {source_checkpoint}")
+            _print_rank0(f"Loading from run {source_run_id}: {source_checkpoint}")
         elif source_checkpoint:
-            print(f"Loading from checkpoint: {source_checkpoint}")
+            _print_rank0(f"Loading from checkpoint: {source_checkpoint}")
         else:
             raise ValueError("staged_training requires either source_run_id or source_checkpoint")
 
@@ -94,7 +131,7 @@ def run_single_training(config_path: str):
                 stage_kwargs[field] = staged_config[field]
 
         model = MusicVAE.load_for_stage(source_checkpoint, **stage_kwargs)
-        print(f"=== END STAGED TRAINING SETUP ===\n")
+        _print_rank0("=== END STAGED TRAINING SETUP ===\n")
     else:
         model = MusicVAE(**model_config)
 
@@ -104,7 +141,7 @@ def run_single_training(config_path: str):
         use_rests = "rests" in str(ds_path).lower()
         tokenizer = REMI(TokenizerConfig(use_rests=use_rests))
         model.set_tokenizer(tokenizer)
-        print(f"Tokenizer set for F1 evaluation (use_rests={use_rests})")
+        _print_rank0(f"Tokenizer set for F1 evaluation (use_rests={use_rests})")
 
     trainer_config = config["trainer"].copy()
     trainer_config["logger"] = WandbLogger(
@@ -117,20 +154,22 @@ def run_single_training(config_path: str):
     # Support resuming from checkpoint
     resume_from = config.get("resume_from")
     if resume_from:
-        print(f"Resuming from checkpoint: {resume_from}")
+        _print_rank0(f"Resuming from checkpoint: {resume_from}")
     trainer.fit(model, train_loader, val_loader, ckpt_path=resume_from)
 
-    checkpoint_dir = Path("checkpoints")
-    run_dir = checkpoint_dir / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # Only do checkpoint management on main process
+    if _is_main_process():
+        checkpoint_dir = Path("checkpoints")
+        run_dir = checkpoint_dir / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    # move last.ckpt to run-specific folder
-    last_ckpt = checkpoint_dir / "last.ckpt"
-    if last_ckpt.exists():
-        shutil.move(str(last_ckpt), str(run_dir / "last.ckpt"))
-        print(f"Moved last.ckpt to {run_dir}")
+        # move last.ckpt to run-specific folder
+        last_ckpt = checkpoint_dir / "last.ckpt"
+        if last_ckpt.exists():
+            shutil.move(str(last_ckpt), str(run_dir / "last.ckpt"))
+            _print_rank0(f"Moved last.ckpt to {run_dir}")
 
-    print(f"\nCompleted training run: {run_name}\n")
+    _print_rank0(f"\nCompleted training run: {run_name}\n")
     wandb.finish()
     del trainer_config["logger"]
 
@@ -169,16 +208,16 @@ TODO: relatedly, you may need to reduce epoch length b/c you have 24M samples
 
 
 def main(config_files: list[str]):
-    print(f"Queued {len(config_files)} training runs")
+    _print_rank0(f"Queued {len(config_files)} training runs")
 
     for i, config_path in enumerate(config_files, 1):
-        print(f"\n[{i}/{len(config_files)}] Processing {config_path}")
+        _print_rank0(f"\n[{i}/{len(config_files)}] Processing {config_path}")
         try:
             run_single_training(config_path)
         except Exception as e:
             raise e
-            print(f"ERROR in {config_path}: {e}")
-            print("Continuing to next run...")
+            _print_rank0(f"ERROR in {config_path}: {e}")
+            _print_rank0("Continuing to next run...")
             continue
 
 if __name__ == "__main__":

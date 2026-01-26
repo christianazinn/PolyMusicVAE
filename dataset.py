@@ -24,13 +24,32 @@ class MusicDataset(Dataset):
         return {"sequence": torch.tensor(s, dtype=torch.long), "length": len(s)}
 
 
-def collate_fn(batch: List[Dict], pad_token_id: int = 0):
+def collate_fn(batch: List[Dict], pad_token_id: int = 0, fixed_length: int | None = None):
+    """
+    Collate function for music sequences.
+
+    Args:
+        batch: List of dicts with 'sequence' and 'length' keys
+        pad_token_id: Token ID to use for padding
+        fixed_length: If set, pad all sequences to this length instead of batch max.
+                     This is important for XLA/TPU to avoid recompilation.
+    """
     sequences = [item["sequence"] for item in batch]
     lengths = [item["length"] for item in batch]
 
     padded_sequences = pad_sequence(
         sequences, batch_first=True, padding_value=pad_token_id
     )
+
+    # For XLA/TPU: pad to fixed length to avoid shape variations between batches
+    if fixed_length is not None and padded_sequences.size(1) < fixed_length:
+        batch_size = padded_sequences.size(0)
+        padding_needed = fixed_length - padded_sequences.size(1)
+        pad_tensor = torch.full(
+            (batch_size, padding_needed), pad_token_id,
+            dtype=padded_sequences.dtype, device=padded_sequences.device
+        )
+        padded_sequences = torch.cat([padded_sequences, pad_tensor], dim=1)
 
     return {
         "sequences": padded_sequences,
@@ -109,12 +128,20 @@ def create_dataloaders(
     seed: int = 42,
     pin_memory: bool = True,
     sampler_power: float = 0.0,
+    fixed_length: int | None = None,  # Set to max_seq_len for XLA/TPU
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], Dict]:
+    """
+    Create train/val/test dataloaders.
+
+    Args:
+        fixed_length: If set, pad all sequences to this length (required for XLA/TPU
+                     to avoid recompilation from varying batch shapes)
+    """
     train_hf, val_hf, test_hf, config = create_splits(
         ds_path, val_split, test_split, seed
     )
 
-    collate_func = partial(collate_fn, pad_token_id=config["pad_id"])
+    collate_func = partial(collate_fn, pad_token_id=config["pad_id"], fixed_length=fixed_length)
     dl_kwargs = {
         "batch_size": batch_size,
         "num_workers": num_workers,

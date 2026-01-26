@@ -17,6 +17,31 @@ try:
 except ImportError:
     F1_AVAILABLE = False
 
+# XLA detection and utilities
+def _is_xla_device(device) -> bool:
+    """Check if device is an XLA/TPU device."""
+    return str(device).startswith("xla") or "tpu" in str(device).lower()
+
+def _get_autocast_device_type(device) -> str:
+    """Get the appropriate device type string for autocast."""
+    if _is_xla_device(device):
+        return "xla"
+    elif str(device).startswith("cuda"):
+        return "cuda"
+    return "cpu"
+
+def _is_main_process() -> bool:
+    """Check if this is the main process in distributed training."""
+    import os
+    # Check various distributed environment variables
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    return int(rank) == 0
+
+def _print_rank0(*args, **kwargs):
+    """Print only from rank 0 in distributed settings."""
+    if _is_main_process():
+        print(*args, **kwargs)
+
 torch.set_float32_matmul_precision("medium")
 
 
@@ -139,6 +164,9 @@ class MusicVAE(L.LightningModule):
         bottleneck_dim: int | None = None,  # if set, adds intermediate layer
         # Latent precision: use fp32 for latent space even when model is bf16
         latent_fp32: bool = False,
+        # XLA/TPU optimization settings
+        xla_mode: bool = False,  # Enable XLA-friendly fixed-length decoding
+        skip_ar_eval: bool = False,  # Skip autoregressive F1 eval (expensive on TPU)
         **kwargs,
     ):
         super().__init__()
@@ -172,6 +200,10 @@ class MusicVAE(L.LightningModule):
         self.kl_reduction = kl_reduction
         self.bottleneck_dim = bottleneck_dim
         self.latent_fp32 = latent_fp32
+
+        # XLA/TPU settings
+        self.xla_mode = xla_mode
+        self.skip_ar_eval = skip_ar_eval
 
         # tracking
         self._val_latent_means = []
@@ -357,7 +389,8 @@ class MusicVAE(L.LightningModule):
         if self.latent_fp32:
             # Cast input to fp32 and disable autocast for full fp32 computation
             pooled_fp32 = pooled.float()
-            with torch.amp.autocast(device_type='cuda', enabled=False):
+            device_type = _get_autocast_device_type(pooled.device)
+            with torch.amp.autocast(device_type=device_type, enabled=False):
                 if self.bottleneck_compress is not None:
                     latent_params = self.bottleneck_compress(pooled_fp32)
                 else:
@@ -380,7 +413,8 @@ class MusicVAE(L.LightningModule):
         batch_size = z.shape[0]
         # When latent_fp32=True, compute in fp32 then cast output to model dtype
         if self.latent_fp32:
-            with torch.amp.autocast(device_type='cuda', enabled=False):
+            device_type = _get_autocast_device_type(z.device)
+            with torch.amp.autocast(device_type=device_type, enabled=False):
                 memory = self.latent_to_decoder(z.float())
             # Cast output to match decoder dtype (bf16/fp16)
             memory = memory.to(self.token_embedding.weight.dtype)
@@ -427,13 +461,16 @@ class MusicVAE(L.LightningModule):
         return logits
 
     def decode_autoregressive(self, z, max_length=None, temperature=1.0):
+        """Autoregressive decoding with optional early exit (not XLA-friendly)."""
         if max_length is None:
             max_length = self.max_seq_len
 
+        # Use fixed-length decode on XLA to avoid recompilation
+        if self.xla_mode or _is_xla_device(self.device):
+            return self._decode_fixed_length(z, max_length, temperature)
+
         batch_size = z.shape[0]
-
         generated = torch.full((batch_size, 1), self.bos_id, device=self.device)
-
         memory = self._prepare_decoder_memory(z)
 
         for step in range(max_length):
@@ -457,6 +494,52 @@ class MusicVAE(L.LightningModule):
 
             if (next_tokens.squeeze(-1) == self.eos_id).all():
                 break
+
+        return generated
+
+    def _decode_fixed_length(self, z, max_length, temperature=1.0):
+        """
+        XLA-friendly fixed-length autoregressive decoding.
+
+        Key differences from decode_autoregressive:
+        - No early exit (fixed number of iterations = fixed graph)
+        - Pre-allocated output buffer to avoid dynamic concatenation
+        - No tensor value inspection for control flow
+        """
+        batch_size = z.shape[0]
+
+        # Pre-allocate full output buffer
+        generated = torch.full(
+            (batch_size, max_length + 1), self.pad_id,
+            dtype=torch.long, device=self.device
+        )
+        generated[:, 0] = self.bos_id
+
+        memory = self._prepare_decoder_memory(z)
+
+        # Pre-compute full causal mask once
+        full_causal_mask = self.create_causal_mask(max_length + 1)
+
+        for step in range(max_length):
+            seq_len = step + 1
+            # Use slice of pre-computed mask
+            causal_mask = full_causal_mask[:seq_len, :seq_len]
+
+            embedded = self.token_embedding(generated[:, :seq_len]).transpose(0, 1)
+            embedded = self.pos_encoding(embedded)
+
+            decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
+
+            next_token_logits = self.output_projection(decoded[-1]) / temperature
+
+            if temperature > 0:
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, 1).squeeze(-1)
+            else:
+                next_tokens = next_token_logits.argmax(dim=-1)
+
+            # Write directly to buffer instead of concat
+            generated[:, step + 1] = next_tokens
 
         return generated
 
@@ -544,20 +627,19 @@ class MusicVAE(L.LightningModule):
         )
         kl_per_dim = torch.distributions.kl_divergence(latent_dist, prior).mean()
 
+        # Log as tensors - avoid .item() which forces graph materialization on XLA
         if hasattr(self, "log"):
-            self.log("debug/kl_total_per_example", kl_per_example.item(), on_step=True)
-            self.log("debug/kl_per_dim", kl_per_dim.item(), on_step=True)
+            self.log("debug/kl_total_per_example", kl_per_example, on_step=True)
+            self.log("debug/kl_per_dim", kl_per_dim, on_step=True)
 
         # Select KL reduction mode
         if self.kl_reduction == "per_seq":
             # PhraseVAE-style: sum over dims, mean over batch
             # beta is applied to the total KL per sequence
             kl_raw = kl_per_example
-            kl_before_free_bits = kl_raw.item()
         else:
             # Original: mean over both dims and batch
             kl_raw = kl_per_dim
-            kl_before_free_bits = kl_raw.item()
 
         # Apply free bits
         if self.free_bits is not None:
@@ -572,15 +654,13 @@ class MusicVAE(L.LightningModule):
                 kl_raw - free_bits_threshold, torch.zeros_like(kl_raw)
             )
 
-            kl_after_free_bits = kl_loss.item()
-            reduction_pct = 100 * (
-                1 - kl_after_free_bits / (kl_before_free_bits + 1e-8)
-            )
+            # Compute reduction as tensor operation (avoids .item() calls)
+            reduction_pct = 100.0 * (1.0 - kl_loss / (kl_raw + 1e-8))
 
             if hasattr(self, "log"):
-                self.log("debug/kl_before_free_bits", kl_before_free_bits, on_step=True)
-                self.log("debug/kl_after_free_bits", kl_after_free_bits, on_step=True)
-                self.log("debug/free_bits_threshold", free_bits_threshold, on_step=True)
+                self.log("debug/kl_before_free_bits", kl_raw, on_step=True)
+                self.log("debug/kl_after_free_bits", kl_loss, on_step=True)
+                self.log("debug/free_bits_threshold", float(free_bits_threshold), on_step=True)
                 self.log("debug/kl_reduction_pct", reduction_pct, on_step=True)
         else:
             kl_loss = kl_raw
@@ -715,24 +795,35 @@ class MusicVAE(L.LightningModule):
                 "val/loss_pos_250", position_loss[199], on_epoch=True, sync_dist=True
             )
 
-        # store latent means for similarity analysis
-        if len(self._val_latent_means) < 100:
+        # Store latent means for similarity analysis (only on main process)
+        # On XLA, detach().clone() can cause syncs, so limit collection
+        is_xla = self.xla_mode or _is_xla_device(self.device)
+        max_latent_samples = 20 if is_xla else 100  # Fewer samples on XLA
+        if len(self._val_latent_means) < max_latent_samples:
             self._val_latent_means.append(outputs["latent_dist"].mean.detach().clone())
             self._val_latent_vars.append(
                 outputs["latent_dist"].variance.detach().clone()
             )
 
         # F1 evaluation on first N batches (requires tokenizer to be set)
-        if (
+        # Skip on XLA/TPU if skip_ar_eval is set (autoregressive decode is expensive)
+        # Also only run on global_rank 0 in distributed settings
+        is_xla = self.xla_mode or _is_xla_device(self.device)
+        is_main_process = not hasattr(self, "global_rank") or self.global_rank == 0
+        should_eval_f1 = (
             F1_AVAILABLE
             and self._tokenizer is not None
             and batch_idx < self._val_f1_batches
-        ):
+            and not (is_xla and self.skip_ar_eval)
+            and is_main_process
+        )
+        if should_eval_f1:
             # Reconstruct autoregressively for F1 evaluation
             z = outputs["latent_dist"].mean  # use mean for deterministic eval
             reconstructed_ids = self.decode_autoregressive(z)
 
             # Prepare token lists for F1 computation
+            # Note: .cpu().numpy() forces sync, but this is unavoidable for F1 computation
             original_tokens = sequences.cpu().numpy().tolist()
             recon_tokens = reconstructed_ids.cpu().numpy().tolist()
 
@@ -974,13 +1065,13 @@ class MusicVAE(L.LightningModule):
 
         model.load_state_dict(new_state_dict)
 
-        print(f"Loaded {len(loaded_keys)} parameters from checkpoint")
+        _print_rank0(f"Loaded {len(loaded_keys)} parameters from checkpoint")
         if skipped_keys:
-            print(f"Skipped {len(skipped_keys)} parameters (will be randomly initialized):")
+            _print_rank0(f"Skipped {len(skipped_keys)} parameters (will be randomly initialized):")
             for key in skipped_keys[:10]:  # Show first 10
-                print(f"  - {key}")
+                _print_rank0(f"  - {key}")
             if len(skipped_keys) > 10:
-                print(f"  ... and {len(skipped_keys) - 10} more")
+                _print_rank0(f"  ... and {len(skipped_keys) - 10} more")
 
         # Log configuration changes
         changes = []
@@ -992,9 +1083,9 @@ class MusicVAE(L.LightningModule):
             changes.append(f"training_mode: {hparams.get('training_mode', 'vae')} -> {training_mode}")
 
         if changes:
-            print("Configuration changes:")
+            _print_rank0("Configuration changes:")
             for change in changes:
-                print(f"  - {change}")
+                _print_rank0(f"  - {change}")
 
         return model
 
