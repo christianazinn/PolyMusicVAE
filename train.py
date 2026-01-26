@@ -114,7 +114,11 @@ def run_single_training(config_path: str):
 
     trainer = L.Trainer(use_distributed_sampler=False, **trainer_config)
 
-    trainer.fit(model, train_loader, val_loader)
+    # Support resuming from checkpoint
+    resume_from = config.get("resume_from")
+    if resume_from:
+        print(f"Resuming from checkpoint: {resume_from}")
+    trainer.fit(model, train_loader, val_loader, ckpt_path=resume_from)
 
     checkpoint_dir = Path("checkpoints")
     run_dir = checkpoint_dir / run_name

@@ -245,7 +245,9 @@ def test_f1_scores(
             if len(tokenized) == 0:
                 raise ValueError(f"Empty tokenization for {path}")
 
-            tensor = torch.tensor(tokenized, dtype=torch.int32).unsqueeze(0).to(model.device)
+            tensor = (
+                torch.tensor(tokenized, dtype=torch.int32).unsqueeze(0).to(model.device)
+            )
             latent_dist, _ = model.encode(tensor)
             z = latent_dist.mean if use_mean else latent_dist.sample()
             reconstructed_ids = model.decode_autoregressive(z)
@@ -275,10 +277,12 @@ def test_f1_scores(
                         break
 
                     sequences = batch["sequences"].to(model.device)
-                    batch_size = min(sequences.shape[0], num_val_phrases - phrases_evaluated)
+                    batch_size = min(
+                        sequences.shape[0], num_val_phrases - phrases_evaluated
+                    )
 
                     for i in range(batch_size):
-                        seq = sequences[i:i+1]
+                        seq = sequences[i : i + 1]
 
                         # Remove padding for original
                         seq_np = seq.cpu().numpy()[0]
@@ -299,7 +303,9 @@ def test_f1_scores(
                             original_score = tokenizer.decode([valid_tokens])
                             recon_tokens = reconstructed_ids.cpu().numpy()[0].tolist()
                             # Remove BOS/EOS/PAD from reconstruction
-                            recon_tokens = [t for t in recon_tokens if t not in (0, 1, 2)]
+                            recon_tokens = [
+                                t for t in recon_tokens if t not in (0, 1, 2)
+                            ]
                             reconstructed_score = tokenizer.decode([recon_tokens])
 
                             # Extract notes and compute F1
@@ -314,21 +320,32 @@ def test_f1_scores(
 
                         except Exception as e:
                             if verbose:
-                                print(f"Warning: Failed to decode phrase {phrases_evaluated + i}: {e}")
+                                print(
+                                    f"Warning: Failed to decode phrase {phrases_evaluated + i}: {e}"
+                                )
                             continue
 
                     phrases_evaluated += batch_size
                     pbar.update(batch_size)
 
     # Compute aggregate metrics (micro-averaged)
-    micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    micro_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall) \
-               if (micro_precision + micro_recall) > 0 else 0.0
+    micro_precision = (
+        total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    )
+    micro_recall = (
+        total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    )
+    micro_f1 = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if (micro_precision + micro_recall) > 0
+        else 0.0
+    )
 
     # Compute macro-averaged F1 (average of per-phrase F1s)
     macro_f1 = np.mean([s["f1"] for s in all_scores]) if all_scores else 0.0
-    macro_precision = np.mean([s["precision"] for s in all_scores]) if all_scores else 0.0
+    macro_precision = (
+        np.mean([s["precision"] for s in all_scores]) if all_scores else 0.0
+    )
     macro_recall = np.mean([s["recall"] for s in all_scores]) if all_scores else 0.0
 
     results = {
@@ -390,12 +407,12 @@ def main():
     #     "test/musicvae_melody_example_2.mid",
     # )
     # test_random_noise(model, tokenizer, num_samples=5)
-    print([param.dtype for param in model.parameters()])
-    print("\n")
-    test_latents(model, num_samples=1000)
+    # print([param.dtype for param in model.parameters()])
+    # print("\n")
+    # test_latents(model, num_samples=1000)
     # test_reconstruction(model, tokenizer, "test/test.mid")
     # test_file_reconstruction(model, tokenizer, "test/001.mid")
-    # test_f1_scores(model, tokenizer, num_val_phrases=200, mode="opd")
+    test_f1_scores(model, tokenizer, num_val_phrases=200, mode="opd")
 
 
 if __name__ == "__main__":
