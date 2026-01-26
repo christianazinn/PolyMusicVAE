@@ -1,0 +1,44 @@
+# Stage 5: VAE fine-tuning with KL regularization
+# Unfreeze everything and fine-tune with low beta
+#
+# Start from Stage 4 checkpoint
+
+inherit: default_512
+name: "98_like_96_on_tpu"
+
+data:
+  batch_size: 256
+  ds_path: "/home/christian/vae/data_nb_1_combined"
+
+model:
+  latent_dim: 64
+  num_queries: 4
+  training_mode: "vae"
+  # PhraseVAE-style KL: sum over dims, use low beta
+  kl_reduction: "per_seq"
+  beta_start: 0.0
+  beta_end: 0.01 # Low beta like PhraseVAE
+  beta_warmup_steps: 200000
+  free_bits: 8 # Total free bits budget per sequence
+  learning_rate: 0.0001
+  steps_per_epoch_est: 170761
+
+trainer:
+  max_epochs: 8
+  devices: 32
+  accelerator: "tpu"
+  precision: "bf16-true"
+
+staged_training:
+  enabled: true
+  new_latent_dim: 64
+  source_run_id: 90
+  training_mode: "vae"
+  freeze_encoder: false # Unfreeze everything
+  freeze_decoder: false
+  kl_reduction: "per_seq"
+  beta_start: 0.0
+  beta_end: 0.01
+  beta_warmup_steps: 200000
+  free_bits: 8
+  learning_rate: 0.0001
