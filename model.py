@@ -461,13 +461,23 @@ class MusicVAE(L.LightningModule):
         return logits
 
     def decode_autoregressive(self, z, max_length=None, temperature=1.0):
-        """Autoregressive decoding with optional early exit (not XLA-friendly)."""
+        """Autoregressive decoding with optional early exit (not XLA-friendly).
+
+        WARNING: This is fundamentally incompatible with XLA/TPU because each
+        iteration has different tensor shapes, causing recompilation every step.
+        On XLA, this returns a dummy tensor - use teacher forcing for validation.
+        """
         if max_length is None:
             max_length = self.max_seq_len
 
-        # Use fixed-length decode on XLA to avoid recompilation
-        if self.xla_mode or _is_xla_device(self.device):
-            return self._decode_fixed_length(z, max_length, temperature)
+        # On XLA, autoregressive decode causes massive recompilation (one per step)
+        # Return dummy output - caller should check xla_mode and avoid calling this
+        if self.xla_mode:
+            batch_size = z.shape[0]
+            return torch.full(
+                (batch_size, max_length + 1), self.pad_id,
+                dtype=torch.long, device=self.device
+            )
 
         batch_size = z.shape[0]
         generated = torch.full((batch_size, 1), self.bos_id, device=self.device)
@@ -494,52 +504,6 @@ class MusicVAE(L.LightningModule):
 
             if (next_tokens.squeeze(-1) == self.eos_id).all():
                 break
-
-        return generated
-
-    def _decode_fixed_length(self, z, max_length, temperature=1.0):
-        """
-        XLA-friendly fixed-length autoregressive decoding.
-
-        Key differences from decode_autoregressive:
-        - No early exit (fixed number of iterations = fixed graph)
-        - Pre-allocated output buffer to avoid dynamic concatenation
-        - No tensor value inspection for control flow
-        """
-        batch_size = z.shape[0]
-
-        # Pre-allocate full output buffer
-        generated = torch.full(
-            (batch_size, max_length + 1), self.pad_id,
-            dtype=torch.long, device=self.device
-        )
-        generated[:, 0] = self.bos_id
-
-        memory = self._prepare_decoder_memory(z)
-
-        # Pre-compute full causal mask once
-        full_causal_mask = self.create_causal_mask(max_length + 1)
-
-        for step in range(max_length):
-            seq_len = step + 1
-            # Use slice of pre-computed mask
-            causal_mask = full_causal_mask[:seq_len, :seq_len]
-
-            embedded = self.token_embedding(generated[:, :seq_len]).transpose(0, 1)
-            embedded = self.pos_encoding(embedded)
-
-            decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
-
-            next_token_logits = self.output_projection(decoded[-1]) / temperature
-
-            if temperature > 0:
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, 1).squeeze(-1)
-            else:
-                next_tokens = next_token_logits.argmax(dim=-1)
-
-            # Write directly to buffer instead of concat
-            generated[:, step + 1] = next_tokens
 
         return generated
 
@@ -806,7 +770,7 @@ class MusicVAE(L.LightningModule):
             )
 
         # F1 evaluation on first N batches (requires tokenizer to be set)
-        # Skip on XLA/TPU if skip_ar_eval is set (autoregressive decode is expensive)
+        # ALWAYS skip on XLA/TPU - autoregressive decode causes recompilation per step
         # Also only run on global_rank 0 in distributed settings
         is_xla = self.xla_mode or _is_xla_device(self.device)
         is_main_process = not hasattr(self, "global_rank") or self.global_rank == 0
@@ -814,7 +778,7 @@ class MusicVAE(L.LightningModule):
             F1_AVAILABLE
             and self._tokenizer is not None
             and batch_idx < self._val_f1_batches
-            and not (is_xla and self.skip_ar_eval)
+            and not is_xla  # Always skip on XLA - AR decode is incompatible
             and is_main_process
         )
         if should_eval_f1:

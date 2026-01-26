@@ -127,6 +127,12 @@ def run_single_training(config_path: str):
     else:
         model = MusicVAE(**model_config)
 
+    # Apply XLA settings after model creation (important for staged training)
+    if is_using_tpus:
+        model.xla_mode = True
+        model.skip_ar_eval = True
+        _print_rank0("Applied XLA mode settings to model")
+
     # Set up tokenizer for F1 evaluation during validation
     if TOKENIZER_AVAILABLE:
         ds_path = config["data"].get("ds_path", "")
