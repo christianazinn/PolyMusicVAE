@@ -665,13 +665,23 @@ class MusicVAE(L.LightningModule):
             outputs["logits"], target_sequences, outputs["latent_dist"]
         )
 
-        # primary val metrics
+        # Primary val metrics - always log these
         self.log("val/total_loss", total_loss, on_epoch=True, sync_dist=True)
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
         self.log("val/kl_loss", kl_loss, on_epoch=True, sync_dist=True)
 
-        # compare reconstruction with real latent vs zero latent
-        # (make sure latents are used)
+        # On XLA, skip expensive extra computations (extra forward passes, etc.)
+        # These cause significant slowdown due to extra compute and sync overhead
+        is_xla = self.xla_mode or _is_xla_device(self.device)
+        if is_xla:
+            # Minimal latent stats only
+            latent_mean = outputs["latent_dist"].mean
+            self.log("val/latent_mean_abs_mean", latent_mean.abs().mean(), on_epoch=True, sync_dist=True)
+            return total_loss
+
+        # === Full validation (GPU/CPU only) ===
+
+        # Compare reconstruction with real latent vs zero latent
         z_zero = torch.zeros_like(outputs["z"])
         logits_zero = self.decode_teacher_forcing(z_zero, target_sequences)
         loss_zero = F.cross_entropy(
@@ -690,7 +700,7 @@ class MusicVAE(L.LightningModule):
             sync_dist=True,
         )
 
-        # compare reconstruction with real latent vs boosted latent
+        # Compare reconstruction with real latent vs boosted latent
         z_boosted = outputs["z"] * 10.0
         logits_boosted = self.decode_teacher_forcing(z_boosted, target_sequences)
         loss_boosted = F.cross_entropy(
@@ -707,7 +717,7 @@ class MusicVAE(L.LightningModule):
         latent_mean = outputs["latent_dist"].mean
         latent_std = outputs["latent_dist"].stddev
 
-        # latent stats
+        # Latent stats
         self.log(
             "val/latent_mean_abs_mean",
             latent_mean.abs().mean(),
