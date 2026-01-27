@@ -37,7 +37,7 @@ trainer:
   # Use bf16 for TPU - native support, 2x faster than fp32
   precision: "bf16-true"
   # Reduce logging frequency to minimize syncs
-  log_every_n_steps: 50
+  log_every_n_steps: 500
 
 staged_training:
   enabled: true
