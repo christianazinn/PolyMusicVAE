@@ -404,7 +404,7 @@ class MusicVAE(L.LightningModule):
         mu, logvar = latent_params.chunk(2, dim=-1)
 
         std = torch.exp(0.5 * logvar)
-        dist = Normal(mu, std)
+        dist = Normal(mu, std, validate_args=False)
 
         return dist, encoded
 
@@ -453,7 +453,7 @@ class MusicVAE(L.LightningModule):
         memory = self._prepare_decoder_memory(z)
 
         decoded = self.decoder(
-            embedded, memory, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask
+            embedded, memory, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask, tgt_is_causal=True
         )
 
         logits = self.output_projection(decoded).transpose(0, 1)
@@ -490,7 +490,7 @@ class MusicVAE(L.LightningModule):
             embedded = self.token_embedding(generated).transpose(0, 1)
             embedded = self.pos_encoding(embedded)
 
-            decoded = self.decoder(embedded, memory, tgt_mask=causal_mask)
+            decoded = self.decoder(embedded, memory, tgt_mask=causal_mask, tgt_is_causal=True)
 
             next_token_logits = self.output_projection(decoded[-1]) / temperature
 
@@ -582,7 +582,7 @@ class MusicVAE(L.LightningModule):
         self.log("debug/training_mode", 1.0, on_step=True)  # 1 = VAE
 
         prior = Normal(
-            torch.zeros_like(latent_dist.mean), torch.ones_like(latent_dist.stddev)
+            torch.zeros_like(latent_dist.mean), torch.ones_like(latent_dist.stddev), validate_args=False
         )
 
         # Compute KL both ways for logging
